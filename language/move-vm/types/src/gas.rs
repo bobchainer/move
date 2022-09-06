@@ -194,6 +194,8 @@ pub trait GasMeter {
     /// In the future, we may want to remove this and directly pass a reference to the GasMeter
     /// instance to the native functions to allow gas to be deducted during computation.
     fn charge_native_function(&mut self, amount: InternalGas) -> PartialVMResult<()>;
+
+    fn charged_already_total(&self) -> PartialVMResult<InternalGas>;
 }
 
 /// A dummy gas meter that does not meter anything.
@@ -365,5 +367,9 @@ impl GasMeter for UnmeteredGasMeter {
 
     fn charge_native_function(&mut self, _amount: InternalGas) -> PartialVMResult<()> {
         Ok(())
+    }
+
+    fn charged_already_total(&self) -> PartialVMResult<InternalGas> {
+        Ok(InternalGas::new(0))
     }
 }

@@ -887,6 +887,10 @@ impl Locals {
         )))
     }
 
+    pub fn len(&self) -> usize {
+        self.0.borrow().len()
+    }
+
     pub fn copy_loc(&self, idx: usize) -> PartialVMResult<Value> {
         let v = self.0.borrow();
         match v.get(idx) {

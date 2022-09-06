@@ -10,6 +10,7 @@ use move_binary_format::{
     errors::*,
     file_format::{AbilitySet, LocalIndex},
 };
+use move_core_types::trace::CallTrace;
 use move_core_types::{
     account_address::AccountAddress,
     effects::{ChangeSet, Event},
@@ -40,6 +41,8 @@ pub struct SerializedReturnValues {
     pub mutable_reference_outputs: Vec<(LocalIndex, Vec<u8>, MoveTypeLayout)>,
     /// The return values from the function
     pub return_values: Vec<(Vec<u8>, MoveTypeLayout)>,
+    /// The call traces after function invocation
+    pub call_traces: Vec<CallTrace>,
 }
 
 impl<'r, 'l, S: MoveResolver> Session<'r, 'l, S> {
