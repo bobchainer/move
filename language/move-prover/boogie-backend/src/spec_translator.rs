@@ -24,10 +24,10 @@ use move_model::{
 
 use crate::{
     boogie_helpers::{
-        boogie_byte_blob, boogie_choice_fun_name, boogie_declare_global, boogie_field_sel,
-        boogie_inst_suffix, boogie_modifies_memory_name, boogie_resource_memory_name,
-        boogie_spec_fun_name, boogie_spec_var_name, boogie_struct_name, boogie_type,
-        boogie_type_suffix, boogie_well_formed_expr,
+        boogie_address_blob, boogie_byte_blob, boogie_choice_fun_name, boogie_declare_global,
+        boogie_field_sel, boogie_inst_suffix, boogie_modifies_memory_name,
+        boogie_resource_memory_name, boogie_spec_fun_name, boogie_spec_var_name,
+        boogie_struct_name, boogie_type, boogie_type_suffix, boogie_well_formed_expr,
     },
     options::BoogieOptions,
 };
@@ -637,6 +637,7 @@ impl<'env> SpecTranslator<'env> {
             Value::Number(val) => emit!(self.writer, "{}", val),
             Value::Bool(val) => emit!(self.writer, "{}", val),
             Value::ByteArray(val) => emit!(self.writer, &boogie_byte_blob(self.options, val)),
+            Value::AddressArray(val) => emit!(self.writer, &boogie_address_blob(self.options, val)),
         }
     }
 
@@ -1008,8 +1009,7 @@ impl<'env> SpecTranslator<'env> {
                     emit!(self.writer, "(var {} := {};\n", var_name, quant_var);
                 }
                 Type::ResourceDomain(mid, sid, inst_opt) => {
-                    let memory =
-                        &mid.qualified_inst(*sid, inst_opt.to_owned().unwrap_or_else(Vec::new));
+                    let memory = &mid.qualified_inst(*sid, inst_opt.to_owned().unwrap_or_default());
                     let addr_var = resource_vars.get(&var.name).unwrap();
                     let resource_name = boogie_resource_memory_name(self.env, memory, &None);
                     emit!(
@@ -1114,8 +1114,7 @@ impl<'env> SpecTranslator<'env> {
                 let quant_ty = self.get_node_type(range.node_id());
                 if let Type::ResourceDomain(mid, sid, inst_opt) = quant_ty.skip_reference() {
                     let addr_var = resource_vars.get(&var.name).unwrap();
-                    let memory =
-                        &mid.qualified_inst(*sid, inst_opt.to_owned().unwrap_or_else(Vec::new));
+                    let memory = &mid.qualified_inst(*sid, inst_opt.to_owned().unwrap_or_default());
                     let resource_name = boogie_resource_memory_name(self.env, memory, &None);
                     let resource_value = format!("$ResourceValue({}, {})", resource_name, addr_var);
                     emit!(self.writer, "{{{}}}", resource_value);

@@ -518,14 +518,14 @@ impl<'env, 'translator, 'module_translator> ExpTranslator<'env, 'translator, 'mo
         use HA::SingleType_::*;
         match &ty.value {
             Ref(is_mut, ty) => {
-                let ty = self.translate_hlir_base_type(&*ty);
+                let ty = self.translate_hlir_base_type(ty);
                 if ty == Type::Error {
                     Type::Error
                 } else {
                     Type::Reference(*is_mut, Box::new(ty))
                 }
             }
-            Base(ty) => self.translate_hlir_base_type(&*ty),
+            Base(ty) => self.translate_hlir_base_type(ty),
         }
     }
 
@@ -663,10 +663,10 @@ impl<'env, 'translator, 'module_translator> ExpTranslator<'env, 'translator, 'mo
                     rty
                 }
             }
-            Ref(is_mut, ty) => Type::Reference(*is_mut, Box::new(self.translate_type(&*ty))),
+            Ref(is_mut, ty) => Type::Reference(*is_mut, Box::new(self.translate_type(ty))),
             Fun(args, result) => Type::Fun(
                 self.translate_types(args),
-                Box::new(self.translate_type(&*result)),
+                Box::new(self.translate_type(result)),
             ),
             Unit => Type::Tuple(vec![]),
             Multiple(vst) => Type::Tuple(self.translate_types(vst)),
@@ -684,7 +684,7 @@ impl<'env, 'translator, 'module_translator> ExpTranslator<'env, 'translator, 'mo
         tys_opt
             .as_deref()
             .map(|tys| self.translate_types(tys))
-            .unwrap_or_else(Vec::new)
+            .unwrap_or_default()
     }
 }
 
@@ -732,9 +732,9 @@ impl<'env, 'translator, 'module_translator> ExpTranslator<'env, 'translator, 'mo
                 self.translate_pack(&loc, maccess, generics, fields, expected_type)
             }
             EA::Exp_::IfElse(cond, then, else_) => {
-                let then = self.translate_exp(&*then, expected_type);
-                let else_ = self.translate_exp(&*else_, expected_type);
-                let cond = self.translate_exp(&*cond, &Type::new_prim(PrimitiveType::Bool));
+                let then = self.translate_exp(then, expected_type);
+                let else_ = self.translate_exp(else_, expected_type);
+                let cond = self.translate_exp(cond, &Type::new_prim(PrimitiveType::Bool));
                 let id = self.new_node_id_with_type_loc(expected_type, &loc);
                 ExpData::IfElse(id, cond.into(), then.into_exp(), else_.into_exp())
             }
@@ -1905,31 +1905,53 @@ impl<'env, 'translator, 'module_translator> ExpTranslator<'env, 'translator, 'mo
         result
     }
 
-    pub fn translate_from_move_value(&self, loc: &Loc, value: &MoveValue) -> Value {
-        match value {
-            MoveValue::U8(n) => Value::Number(BigInt::from_u8(*n).unwrap()),
-            MoveValue::U64(n) => Value::Number(BigInt::from_u64(*n).unwrap()),
-            MoveValue::U128(n) => Value::Number(BigInt::from_u128(*n).unwrap()),
-            MoveValue::Bool(b) => Value::Bool(*b),
-            MoveValue::Address(a) => Value::Address(crate::addr_to_big_uint(a)),
-            MoveValue::Signer(a) => Value::Address(crate::addr_to_big_uint(a)),
-            MoveValue::Vector(vs) => {
-                let b = vs
-                    .iter()
-                    .filter_map(|v| match v {
-                        MoveValue::U8(n) => Some(*n),
-                        _ => {
-                            self.error(
-                                loc,
-                                &format!("Not yet supported constant vector value: {:?}", v),
-                            );
-                            None
-                        }
-                    })
-                    .collect::<Vec<u8>>();
-                Value::ByteArray(b)
-            }
-            _ => {
+    pub fn translate_from_move_value(&self, loc: &Loc, ty: &Type, value: &MoveValue) -> Value {
+        match (ty, value) {
+            (_, MoveValue::U8(n)) => Value::Number(BigInt::from_u8(*n).unwrap()),
+            (_, MoveValue::U64(n)) => Value::Number(BigInt::from_u64(*n).unwrap()),
+            (_, MoveValue::U128(n)) => Value::Number(BigInt::from_u128(*n).unwrap()),
+            (_, MoveValue::Bool(b)) => Value::Bool(*b),
+            (_, MoveValue::Address(a)) => Value::Address(crate::addr_to_big_uint(a)),
+            (_, MoveValue::Signer(a)) => Value::Address(crate::addr_to_big_uint(a)),
+            (Type::Vector(inner), MoveValue::Vector(vs)) => match **inner {
+                Type::Primitive(PrimitiveType::U8) => {
+                    let b = vs
+                        .iter()
+                        .filter_map(|v| match v {
+                            MoveValue::U8(n) => Some(*n),
+                            _ => {
+                                self.error(loc, &format!("Expected u8 type, buf found: {:?}", v));
+                                None
+                            }
+                        })
+                        .collect::<Vec<u8>>();
+                    Value::ByteArray(b)
+                }
+                Type::Primitive(PrimitiveType::Address) => {
+                    let b = vs
+                        .iter()
+                        .filter_map(|v| match v {
+                            MoveValue::Address(a) => Some(crate::addr_to_big_uint(a)),
+                            _ => {
+                                self.error(
+                                    loc,
+                                    &format!("Expected address type, but found: {:?}", v),
+                                );
+                                None
+                            }
+                        })
+                        .collect::<Vec<BigUint>>();
+                    Value::AddressArray(b)
+                }
+                _ => {
+                    self.error(
+                        loc,
+                        &format!("Not yet supported constant vector value: {:?}", value),
+                    );
+                    Value::Bool(false)
+                }
+            },
+            (_, _) => {
                 self.error(
                     loc,
                     &format!("Not yet supported constant value: {:?}", value),
