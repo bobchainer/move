@@ -14,7 +14,6 @@ use move_binary_format::{
 };
 use move_core_types::{
     account_address::AccountAddress,
-    gas_algebra::InternalGas,
     gas_algebra::{NumArgs, NumBytes},
     language_storage::TypeTag,
     trace::{CallTrace, CallType},
@@ -176,22 +175,32 @@ impl Interpreter {
             current_frame.extract_types_and_arguments(loader, data_store);
 
         loop {
+            let formatted_module_id: Option<String>;
+
+            if let Some(module_id) = current_frame.function.module_id() {
+                formatted_module_id = Some(module_id.short_str_lossless());
+            } else {
+                formatted_module_id = None;
+            }
+
             let mut call_trace = CallTrace {
                 depth: self.call_stack.len() as u32,
                 call_type: match current_frame.ty_args.len() > 0 {
                     true => CallType::CallGeneric,
                     false => CallType::Call,
                 },
-                module_address: None, // @TODO: implement
+                module_id: formatted_module_id,
                 function: current_frame.function.name().into(),
                 ty_args: current_frame
                     .ty_args
                     .iter()
-                    .map(|ty| loader.type_to_type_layout(&ty).unwrap())
+                    .map(|ty| {
+                        loader.type_to_type_layout(&ty).unwrap().to_string().into_bytes()
+                    })
                     .collect(),
                 args_types: args_types.clone(),
                 args_values: args_values.clone(),
-                gas_used: InternalGas::zero(),
+                gas_used: 0,
                 err: None,
             };
 
@@ -203,14 +212,16 @@ impl Interpreter {
                     call_trace.err = Some(err.clone().into_vm_status());
                     call_trace.gas_used = gas_used_after_call
                         .checked_sub(gas_used_before_call)
-                        .unwrap();
+                        .unwrap()
+                        .into();
                     self.maybe_core_dump(err, &current_frame)
                 })?;
 
             let gas_used_after_call = gas_meter.charged_already_total().unwrap();
             call_trace.gas_used = gas_used_after_call
                 .checked_sub(gas_used_before_call)
-                .unwrap();
+                .unwrap()
+                .into();
 
             self.call_traces.push(call_trace);
 
@@ -269,6 +280,7 @@ impl Interpreter {
                         let err = set_err_info!(frame, err);
                         self.maybe_core_dump(err, &frame)
                     })?;
+
                     current_frame = frame;
                 }
                 ExitCode::CallGeneric(idx) => {
@@ -316,6 +328,7 @@ impl Interpreter {
                         let err = set_err_info!(frame, err);
                         self.maybe_core_dump(err, &frame)
                     })?;
+
                     current_frame = frame;
                 }
             }
@@ -1467,7 +1480,11 @@ impl Frame {
         &self,
         loader: &Loader,
         data_store: &mut impl DataStore,
-    ) -> (Vec<MoveTypeLayout>, Vec<Vec<u8>>) {
+    ) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        if self.function.module_id().is_none() {
+            return (vec![], vec![]);
+        }
+
         let function_parameters: Vec<Type> = loader
             .function_parameters(
                 &self.function,
@@ -1481,8 +1498,8 @@ impl Frame {
             .map_err(|err| err.finish(Location::Undefined))
             .unwrap();
 
-        let mut args_types = vec![];
-        let mut args_values = vec![];
+        let mut args_types: Vec<Vec<u8>> = vec![];
+        let mut args_values: Vec<Vec<u8>> = vec![];
 
         for i in 0..function_parameters.len() {
             let arg_type = function_parameters.get(i.clone()).unwrap();
@@ -1515,7 +1532,7 @@ impl Frame {
                 }
             }
 
-            args_types.push(arg_type_layout);
+            args_types.push(arg_type_layout.to_string().into_bytes());
             args_values.push(arg_value);
         }
 
