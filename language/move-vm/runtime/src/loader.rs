@@ -712,8 +712,9 @@ impl Loader {
         data_store: &impl DataStore,
     ) -> VMResult<Vec<Type>> {
         let module = self.load_module(module_id, data_store)?;
+        let params = self.function_parameters_with_module(func, &module)?;
 
-        Ok(self.function_parameters_with_module(func, &module)?)
+        Ok(params)
     }
 
     pub(crate) fn function_parameters_with_module(
@@ -721,7 +722,7 @@ impl Loader {
         func: &Arc<Function>,
         module: &Arc<Module>,
     ) -> VMResult<Vec<Type>> {
-        Ok(func
+        let params = func
             .parameters
             .0
             .iter()
@@ -731,7 +732,9 @@ impl Loader {
                     .make_type(BinaryIndexedView::Module(module.module()), tok)
             })
             .collect::<PartialVMResult<Vec<_>>>()
-            .map_err(|err| err.finish(Location::Undefined))?)
+            .map_err(|err| err.finish(Location::Undefined))?;
+
+        Ok(params)
     }
 
     // Entry point for module publishing (`MoveVM::publish_module_bundle`).

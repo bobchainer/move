@@ -122,7 +122,22 @@ impl Interpreter {
             call_stack: CallStack::new(),
             call_traces: Vec::new(),
         }
-        .execute_main(
+    }
+
+    /// Internal execution entry point.
+    fn execute(
+        &mut self,
+        loader: &Loader,
+        data_store: &mut impl DataStore,
+        gas_meter: &mut impl GasMeter,
+        extensions: &mut NativeContextExtensions,
+        function: Arc<Function>,
+        ty_args: Vec<Type>,
+        args: Vec<Value>,
+    ) -> VMResult<Vec<Value>> {
+        // No unwinding of the call stack and value stack need to be done here -- the context will
+        // take care of that.
+        self.execute_main(
             loader, data_store, gas_meter, extensions, function, ty_args, args,
         )
     }
@@ -134,7 +149,7 @@ impl Interpreter {
     /// on call. When that happens the frame is changes to a new one (call) or to the one
     /// at the top of the stack (return). If the call stack is empty execution is completed.
     fn execute_main(
-        mut self,
+        &mut self,
         loader: &Loader,
         data_store: &mut impl DataStore,
         gas_meter: &mut impl GasMeter,
@@ -168,7 +183,7 @@ impl Interpreter {
 
             let mut call_trace = CallTrace {
                 depth: self.call_stack.len() as u32,
-                call_type: match current_frame.ty_args.len() > 0 {
+                call_type: match !current_frame.ty_args.is_empty() {
                     true => CallType::CallGeneric,
                     false => CallType::Call,
                 },
@@ -178,7 +193,7 @@ impl Interpreter {
                     .ty_args
                     .iter()
                     .map(|ty| {
-                        loader.type_to_type_layout(&ty).unwrap().to_string().into_bytes()
+                        loader.type_to_type_layout(ty).unwrap().to_string().into_bytes()
                     })
                     .collect(),
                 args_types: args_types.clone(),
@@ -190,7 +205,7 @@ impl Interpreter {
             let resolver = current_frame.resolver(loader);
             let exit_code =
                 current_frame //self
-                    .execute_code(&resolver, &mut self, data_store, gas_meter)
+                    .execute_code(&resolver, self, data_store, gas_meter)
                     .map_err(|err| {
                     let gas_used_after_call = gas_meter.charged_already_total().unwrap();
                     call_trace.err = Some(err.clone().into_vm_status());
@@ -1501,7 +1516,7 @@ impl Frame {
         let mut args_values: Vec<Vec<u8>> = vec![];
 
         for i in 0..function_parameters.len() {
-            let arg_type = function_parameters.get(i.clone()).unwrap();
+            let arg_type = function_parameters.get(i).unwrap();
 
             let arg_type_layout: MoveTypeLayout;
             let arg_value: Vec<u8>;
@@ -1525,7 +1540,7 @@ impl Frame {
                 _ => {
                     arg_type_layout = loader.type_to_type_layout(arg_type).unwrap();
 
-                    let value = self.locals.copy_loc(i.clone()).unwrap();
+                    let value = self.locals.copy_loc(i).unwrap();
 
                     arg_value = value.simple_serialize(&arg_type_layout).unwrap();
                 }
