@@ -208,7 +208,7 @@ impl Type {
                     module,
                     name,
                     type_arguments,
-                } => TypeTag::Struct(StructTag {
+                } => TypeTag::Struct(Box::new(StructTag {
                     address,
                     module,
                     name,
@@ -220,7 +220,7 @@ impl Type {
                             )
                         })
                         .collect(),
-                }),
+                })),
                 TypeParameter(_) => unreachable!(),
             }
         } else {
@@ -230,7 +230,7 @@ impl Type {
 
     pub fn into_struct_tag(self) -> Option<StructTag> {
         match self.into_type_tag()? {
-            TypeTag::Struct(s) => Some(s),
+            TypeTag::Struct(s) => Some(*s),
             _ => None,
         }
     }
@@ -280,7 +280,10 @@ impl Struct {
     pub fn new(m: &CompiledModule, def: &StructDefinition) -> (Identifier, Self) {
         let handle = m.struct_handle_at(def.struct_handle);
         let fields = match &def.field_information {
-            StructFieldInformation::Native => panic!("Can't extract for native struct"),
+            StructFieldInformation::Native => {
+                // Pretend for compatibility checking no fields
+                vec![]
+            }
             StructFieldInformation::Declared(fields) => {
                 fields.iter().map(|f| Field::new(m, f)).collect()
             }
