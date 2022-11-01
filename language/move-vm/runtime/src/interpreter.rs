@@ -73,7 +73,7 @@ pub(crate) struct Interpreter {
 }
 
 pub(crate) struct InterpreterEntrypointResult {
-    pub values: VMResult<Vec<Value>>,
+    pub values: Vec<Value>,
     pub call_traces: Vec<CallTrace>,
 }
 
@@ -207,7 +207,7 @@ impl Interpreter {
                         // end of execution. `self` should no longer be used afterward
                         return Ok(
                             InterpreterEntrypointResult {
-                                values: Ok(self.operand_stack.0),
+                                values: self.operand_stack.0,
                                 call_traces: self.call_traces
                             }
                         )

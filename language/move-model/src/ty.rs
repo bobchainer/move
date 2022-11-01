@@ -50,17 +50,17 @@ pub const NUM_TYPE: Type = Type::Primitive(PrimitiveType::Num);
 pub enum PrimitiveType {
     Bool,
     U8,
-    U16,
-    U32,
     U64,
     U128,
-    U256,
     Address,
     Signer,
     // Types only appearing in specifications
     Num,
     Range,
     EventStore,
+    U16,
+    U32,
+    U256,
 }
 
 /// A type substitution.
@@ -413,10 +413,16 @@ impl Type {
                 env.get_struct_type(mid, sid, &ts),
             Vector(et) => Some(MType::Vector(
                 Box::new(et.into_normalized_type(env)
-                    .expect("Invariant violation: vector type argument contains incomplete, tuple, reference, or spec type"))
+                    .expect("Invariant violation: vector type argument contains incomplete, tuple, or spec type"))
             )),
+            Reference(r, t) =>
+                if r {
+                    Some(MType::MutableReference(Box::new(t.into_normalized_type(env).expect("Invariant violation: reference type contains incomplete, tuple, or spec type"))))
+                } else {
+                    Some(MType::Reference(Box::new(t.into_normalized_type(env).expect("Invariant violation: reference type contains incomplete, tuple, or spec type"))))
+                }
             TypeParameter(idx) => Some(MType::TypeParameter(idx as u16)),
-            Tuple(..) | Error | Fun(..) | TypeDomain(..) | ResourceDomain(..) | Var(..) | Reference(..) =>
+            Tuple(..) | Error | Fun(..) | TypeDomain(..) | ResourceDomain(..) | Var(..) =>
                 None
         }
     }

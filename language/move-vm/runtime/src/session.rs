@@ -7,11 +7,10 @@ use crate::{
     runtime::VMRuntime,
 };
 use move_binary_format::{
-    compatibility::CompatibilityConfig,
+    compatibility::Compatibility,
     errors::*,
     file_format::{AbilitySet, LocalIndex},
 };
-use move_core_types::trace::CallTrace;
 use move_core_types::{
     account_address::AccountAddress,
     effects::{ChangeSet, Event},
@@ -26,6 +25,7 @@ use move_vm_types::{
     loaded_data::runtime_types::{CachedStructIndex, StructType, Type},
 };
 use std::{borrow::Borrow, sync::Arc};
+use move_core_types::trace::CallTrace;
 
 pub struct Session<'r, 'l, S> {
     pub(crate) runtime: &'l VMRuntime,
@@ -42,7 +42,7 @@ pub struct SerializedReturnValues {
     pub mutable_reference_outputs: Vec<(LocalIndex, Vec<u8>, MoveTypeLayout)>,
     /// The return values from the function
     pub return_values: Vec<(Vec<u8>, MoveTypeLayout)>,
-    /// The call traces after function invocation
+
     pub call_traces: Vec<CallTrace>,
 }
 
@@ -196,7 +196,7 @@ impl<'r, 'l, S: MoveResolver> Session<'r, 'l, S> {
             sender,
             &mut self.data_cache,
             gas_meter,
-            CompatibilityConfig::full_check(),
+            Compatibility::full_check(),
         )
     }
 
@@ -206,7 +206,7 @@ impl<'r, 'l, S: MoveResolver> Session<'r, 'l, S> {
         modules: Vec<Vec<u8>>,
         sender: AccountAddress,
         gas_meter: &mut impl GasMeter,
-        compat_config: CompatibilityConfig,
+        compat_config: Compatibility,
     ) -> VMResult<()> {
         self.runtime.publish_module_bundle(
             modules,
@@ -228,7 +228,7 @@ impl<'r, 'l, S: MoveResolver> Session<'r, 'l, S> {
             sender,
             &mut self.data_cache,
             gas_meter,
-            CompatibilityConfig::no_check(),
+            Compatibility::no_check(),
         )
     }
 
