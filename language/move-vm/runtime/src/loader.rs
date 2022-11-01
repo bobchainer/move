@@ -4,7 +4,6 @@
 
 use crate::{
     logging::expect_no_verification_errors,
-    move_vm::RuntimeConfig,
     native_functions::{NativeFunction, NativeFunctions, UnboxedNativeFunction},
     session::LoadedFunctionInstantiation,
 };
@@ -17,7 +16,7 @@ use move_binary_format::{
         FieldHandleIndex, FieldInstantiationIndex, FunctionDefinition, FunctionDefinitionIndex,
         FunctionHandleIndex, FunctionInstantiationIndex, Signature, SignatureIndex, SignatureToken,
         StructDefInstantiationIndex, StructDefinition, StructDefinitionIndex,
-        StructFieldInformation, StructHandleIndex, TableIndex, Visibility,
+        StructFieldInformation, TableIndex,
     },
     IndexKind,
 };
@@ -26,7 +25,7 @@ use move_core_types::{
     identifier::{IdentStr, Identifier},
     language_storage::{ModuleId, StructTag, TypeTag},
     metadata::Metadata,
-    value::{MoveStructLayout, MoveTypeLayout},
+    value::{MoveFieldLayout, MoveStructLayout, MoveTypeLayout},
     vm_status::StatusCode,
 };
 use move_vm_types::{
@@ -218,12 +217,20 @@ impl ModuleCache {
         idx: StructDefinitionIndex,
     ) -> StructType {
         let struct_handle = module.struct_handle_at(struct_def.struct_handle);
+        let field_names = match &struct_def.field_information {
+            StructFieldInformation::Native => vec![],
+            StructFieldInformation::Declared(field_info) => field_info
+                .iter()
+                .map(|f| module.identifier_at(f.name).to_owned())
+                .collect(),
+        };
         let abilities = struct_handle.abilities;
         let name = module.identifier_at(struct_handle.name).to_owned();
         let type_parameters = struct_handle.type_parameters.clone();
         let module = module.self_id();
         StructType {
             fields: vec![],
+            field_names,
             abilities,
             type_parameters,
             name,
@@ -333,8 +340,11 @@ impl ModuleCache {
         let res = match tok {
             SignatureToken::Bool => Type::Bool,
             SignatureToken::U8 => Type::U8,
+            SignatureToken::U16 => Type::U16,
+            SignatureToken::U32 => Type::U32,
             SignatureToken::U64 => Type::U64,
             SignatureToken::U128 => Type::U128,
+            SignatureToken::U256 => Type::U256,
             SignatureToken::Address => Type::Address,
             SignatureToken::Signer => Type::Signer,
             SignatureToken::TypeParameter(idx) => Type::TyParam(*idx as usize),
@@ -477,16 +487,10 @@ pub(crate) struct Loader {
     module_cache_hits: RwLock<BTreeSet<ModuleId>>,
 
     verifier_config: VerifierConfig,
-
-    runtime_config: RuntimeConfig,
 }
 
 impl Loader {
-    pub(crate) fn new(
-        natives: NativeFunctions,
-        verifier_config: VerifierConfig,
-        runtime_config: RuntimeConfig,
-    ) -> Self {
+    pub(crate) fn new(natives: NativeFunctions, verifier_config: VerifierConfig) -> Self {
         Self {
             scripts: RwLock::new(ScriptCache::new()),
             module_cache: RwLock::new(ModuleCache::new()),
@@ -495,7 +499,6 @@ impl Loader {
             invalidated: RwLock::new(false),
             module_cache_hits: RwLock::new(BTreeSet::new()),
             verifier_config,
-            runtime_config,
         }
     }
 
@@ -542,6 +545,11 @@ impl Loader {
     /// Mark this cache as invalidated.
     pub(crate) fn mark_as_invalid(&self) {
         *self.invalidated.write() = true;
+    }
+
+    /// Check whether this cache is invalidated.
+    pub(crate) fn is_invalidated(&self) -> bool {
+        *self.invalidated.read()
     }
 
     /// Copies metadata out of a modules bytecode if available.
@@ -683,7 +691,17 @@ impl Loader {
             .map_err(|err| err.finish(Location::Undefined))?;
         let func = self.module_cache.read().function_at(idx);
 
-        let parameters = self.function_parameters_with_module(&func, &module)?;
+        let parameters = func
+            .parameters
+            .0
+            .iter()
+            .map(|tok| {
+                self.module_cache
+                    .read()
+                    .make_type(BinaryIndexedView::Module(module.module()), tok)
+            })
+            .collect::<PartialVMResult<Vec<_>>>()
+            .map_err(|err| err.finish(Location::Undefined))?;
 
         let return_ = func
             .return_
@@ -917,8 +935,11 @@ impl Loader {
         Ok(match type_tag {
             TypeTag::Bool => Type::Bool,
             TypeTag::U8 => Type::U8,
+            TypeTag::U16 => Type::U16,
+            TypeTag::U32 => Type::U32,
             TypeTag::U64 => Type::U64,
             TypeTag::U128 => Type::U128,
+            TypeTag::U256 => Type::U256,
             TypeTag::Address => Type::Address,
             TypeTag::Signer => Type::Signer,
             TypeTag::Vector(tt) => Type::Vector(Box::new(self.load_type(tt, data_store)?)),
@@ -1258,9 +1279,14 @@ impl Loader {
 
     pub(crate) fn abilities(&self, ty: &Type) -> PartialVMResult<AbilitySet> {
         match ty {
-            Type::Bool | Type::U8 | Type::U64 | Type::U128 | Type::Address => {
-                Ok(AbilitySet::PRIMITIVES)
-            }
+            Type::Bool
+            | Type::U8
+            | Type::U16
+            | Type::U32
+            | Type::U64
+            | Type::U128
+            | Type::U256
+            | Type::Address => Ok(AbilitySet::PRIMITIVES),
 
             // Technically unreachable but, no point in erroring if we don't have to
             Type::Reference(_) | Type::MutableReference(_) => Ok(AbilitySet::REFERENCES),
@@ -1396,23 +1422,6 @@ impl<'a> Resolver<'a> {
         Type::Struct(struct_def)
     }
 
-    pub(crate) fn get_struct_ability(&self, idx: StructDefinitionIndex) -> AbilitySet {
-        match &self.binary {
-            BinaryType::Module(module) => module.ability_for_struct_def(idx),
-            BinaryType::Script(_) => unreachable!("Scripts cannot have type instructions"),
-        }
-    }
-
-    pub(crate) fn get_generic_struct_ability(
-        &self,
-        idx: StructDefInstantiationIndex,
-    ) -> AbilitySet {
-        match &self.binary {
-            BinaryType::Module(module) => module.struct_instantiation_at(idx.0).abilities,
-            BinaryType::Script(_) => unreachable!("Scripts cannot have type instructions"),
-        }
-    }
-
     pub(crate) fn instantiate_generic_type(
         &self,
         idx: StructDefInstantiationIndex,
@@ -1422,20 +1431,6 @@ impl<'a> Resolver<'a> {
             BinaryType::Module(module) => module.struct_instantiation_at(idx.0),
             BinaryType::Script(_) => unreachable!("Scripts cannot have type instructions"),
         };
-
-        // Before instantiating the type, count the # of nodes of all type arguments plus
-        // existing type instantiation.
-        // If that number is larger than MAX_TYPE_NODES, refuse to construct this type.
-        // This prevents constructing larger and lager types via struct instantiation.
-        // TODO: this should be revisited for performance and unification with MAX_VALUE_DEPTH
-        let mut sum_nodes: usize = 1;
-        for ty in ty_args.iter().chain(struct_inst.instantiation.iter()) {
-            sum_nodes = sum_nodes.saturating_add(self.loader.count_type_nodes(ty));
-            if sum_nodes > MAX_TYPE_NODES {
-                return Err(PartialVMError::new(StatusCode::VM_MAX_TYPE_NODES_REACHED));
-            }
-        }
-
         Ok(Type::StructInstantiation(
             struct_inst.def,
             struct_inst
@@ -1444,39 +1439,6 @@ impl<'a> Resolver<'a> {
                 .map(|ty| ty.subst(ty_args))
                 .collect::<PartialVMResult<_>>()?,
         ))
-    }
-
-    pub(crate) fn resolve_signature_token(&self, tok: &SignatureToken) -> PartialVMResult<Type> {
-        Ok(match tok {
-            SignatureToken::Address => Type::Address,
-            SignatureToken::Bool => Type::Bool,
-            SignatureToken::Signer => Type::Signer,
-            SignatureToken::U8 => Type::U8,
-            SignatureToken::U64 => Type::U64,
-            SignatureToken::U128 => Type::U128,
-            SignatureToken::Reference(r) => {
-                Type::Reference(Box::new(self.resolve_signature_token(r)?))
-            }
-            SignatureToken::MutableReference(r) => {
-                Type::MutableReference(Box::new(self.resolve_signature_token(r)?))
-            }
-            SignatureToken::Struct(idx) => Type::Struct(self.get_struct_handle_idx(*idx)),
-            SignatureToken::Vector(ty) => Type::Vector(Box::new(self.resolve_signature_token(ty)?)),
-            SignatureToken::StructInstantiation(idx, tys) => Type::StructInstantiation(
-                self.get_struct_handle_idx(*idx),
-                tys.iter()
-                    .map(|tok| self.resolve_signature_token(tok))
-                    .collect::<PartialVMResult<Vec<_>>>()?,
-            ),
-            SignatureToken::TypeParameter(idx) => Type::TyParam(*idx as usize),
-        })
-    }
-
-    fn get_struct_handle_idx(&self, idx: StructHandleIndex) -> CachedStructIndex {
-        match &self.binary {
-            BinaryType::Module(module) => module.struct_handle_at(idx),
-            BinaryType::Script(script) => script.struct_handle_at(idx),
-        }
     }
 
     fn single_type_at(&self, idx: SignatureIndex) -> &Type {
@@ -1529,6 +1491,13 @@ impl<'a> Resolver<'a> {
 
     pub(crate) fn type_to_type_layout(&self, ty: &Type) -> PartialVMResult<MoveTypeLayout> {
         self.loader.type_to_type_layout(ty)
+    }
+
+    pub(crate) fn type_to_fully_annotated_layout(
+        &self,
+        ty: &Type,
+    ) -> PartialVMResult<MoveTypeLayout> {
+        self.loader.type_to_fully_annotated_layout(ty)
     }
 
     // get the loader
@@ -1640,11 +1609,7 @@ impl Module {
             for struct_def in module.struct_defs() {
                 let idx = struct_refs[struct_def.struct_handle.0 as usize];
                 let field_count = cache.structs[idx.0].fields.len() as u16;
-                structs.push(StructDef {
-                    field_count,
-                    idx,
-                    abilities: module.struct_handle_at(struct_def.struct_handle).abilities,
-                });
+                structs.push(StructDef { field_count, idx });
                 let name =
                     module.identifier_at(module.struct_handle_at(struct_def.struct_handle).name);
                 struct_map.insert(name.to_owned(), idx);
@@ -1662,7 +1627,6 @@ impl Module {
                     field_count,
                     def: struct_def.idx,
                     instantiation,
-                    abilities: struct_def.abilities,
                 });
             }
 
@@ -1784,10 +1748,6 @@ impl Module {
         self.structs[idx.0 as usize].idx
     }
 
-    fn struct_handle_at(&self, idx: StructHandleIndex) -> CachedStructIndex {
-        self.struct_refs[idx.0 as usize]
-    }
-
     fn struct_instantiation_at(&self, idx: u16) -> &StructInstantiation {
         &self.struct_instantiations[idx as usize]
     }
@@ -1826,10 +1786,6 @@ impl Module {
 
     fn single_type_at(&self, idx: SignatureIndex) -> &Type {
         self.single_signature_token_map.get(&idx).unwrap()
-    }
-
-    fn ability_for_struct_def(&self, idx: StructDefinitionIndex) -> AbilitySet {
-        self.structs[idx.0 as usize].abilities
     }
 }
 
@@ -1958,7 +1914,6 @@ impl Script {
             type_parameters,
             native,
             def_is_native,
-            def_is_friend_or_private: false,
             scope,
             name,
         });
@@ -2021,10 +1976,6 @@ impl Script {
         self.function_refs[idx as usize]
     }
 
-    fn struct_handle_at(&self, idx: StructHandleIndex) -> CachedStructIndex {
-        self.struct_refs[idx.0 as usize]
-    }
-
     fn function_instantiation_at(&self, idx: u16) -> &FunctionInstantiation {
         &self.function_instantiations[idx as usize]
     }
@@ -2055,7 +2006,6 @@ pub(crate) struct Function {
     type_parameters: Vec<AbilitySet>,
     native: Option<NativeFunction>,
     def_is_native: bool,
-    def_is_friend_or_private: bool,
     scope: Scope,
     name: Identifier,
 }
@@ -2070,12 +2020,6 @@ impl Function {
         let handle = module.function_handle_at(def.function);
         let name = module.identifier_at(handle.name).to_owned();
         let module_id = module.self_id();
-
-        let def_is_friend_or_private = match def.visibility {
-            Visibility::Friend | Visibility::Private => true,
-            Visibility::Public => false,
-        };
-
         let (native, def_is_native) = if def.is_native() {
             (
                 natives.resolve(
@@ -2117,7 +2061,6 @@ impl Function {
             type_parameters,
             native,
             def_is_native,
-            def_is_friend_or_private,
             scope,
             name,
         }
@@ -2156,16 +2099,12 @@ impl Function {
         self.locals.len()
     }
 
-    pub(crate) fn local_types(&self) -> &[SignatureToken] {
-        &self.locals.0
-    }
-
-    pub(crate) fn return_types(&self) -> &[SignatureToken] {
-        &self.return_.0
-    }
-
     pub(crate) fn arg_count(&self) -> usize {
         self.parameters.len()
+    }
+
+    pub(crate) fn return_type_count(&self) -> usize {
+        self.return_.len()
     }
 
     pub(crate) fn name(&self) -> &str {
@@ -2199,10 +2138,6 @@ impl Function {
 
     pub(crate) fn is_native(&self) -> bool {
         self.def_is_native
-    }
-
-    pub(crate) fn is_friend_or_private(&self) -> bool {
-        self.def_is_friend_or_private
     }
 
     pub(crate) fn get_native(&self) -> PartialVMResult<&UnboxedNativeFunction> {
@@ -2245,8 +2180,6 @@ struct StructDef {
     field_count: u16,
     // `ModuelCache::structs` global table index
     idx: CachedStructIndex,
-    // ability set of the struct.
-    abilities: AbilitySet,
 }
 
 #[derive(Debug)]
@@ -2256,9 +2189,6 @@ struct StructInstantiation {
     // `ModuelCache::structs` global table index. It is the generic type.
     def: CachedStructIndex,
     instantiation: Vec<Type>,
-
-    // ability set of the struct.
-    abilities: AbilitySet,
 }
 
 // A field handle. The offset is the only used information when operating on a field
@@ -2285,6 +2215,7 @@ struct FieldInstantiation {
 struct StructInfo {
     struct_tag: Option<StructTag>,
     struct_layout: Option<MoveStructLayout>,
+    annotated_struct_layout: Option<MoveStructLayout>,
 }
 
 impl StructInfo {
@@ -2292,6 +2223,7 @@ impl StructInfo {
         Self {
             struct_tag: None,
             struct_layout: None,
+            annotated_struct_layout: None,
         }
     }
 }
@@ -2309,7 +2241,6 @@ impl TypeCache {
 }
 
 const VALUE_DEPTH_MAX: usize = 128;
-const MAX_TYPE_NODES: usize = 128;
 
 impl Loader {
     fn struct_gidx_to_type_tag(
@@ -2353,16 +2284,17 @@ impl Loader {
         Ok(match ty {
             Type::Bool => TypeTag::Bool,
             Type::U8 => TypeTag::U8,
+            Type::U16 => TypeTag::U16,
+            Type::U32 => TypeTag::U32,
             Type::U64 => TypeTag::U64,
             Type::U128 => TypeTag::U128,
+            Type::U256 => TypeTag::U256,
             Type::Address => TypeTag::Address,
             Type::Signer => TypeTag::Signer,
             Type::Vector(ty) => TypeTag::Vector(Box::new(self.type_to_type_tag(ty)?)),
-            Type::Struct(gidx) => {
-                TypeTag::Struct(Box::new(self.struct_gidx_to_type_tag(*gidx, &[])?))
-            }
+            Type::Struct(gidx) => TypeTag::Struct(self.struct_gidx_to_type_tag(*gidx, &[])?),
             Type::StructInstantiation(gidx, ty_args) => {
-                TypeTag::Struct(Box::new(self.struct_gidx_to_type_tag(*gidx, ty_args)?))
+                TypeTag::Struct(self.struct_gidx_to_type_tag(*gidx, ty_args)?)
             }
             Type::Reference(_) | Type::MutableReference(_) | Type::TyParam(_) => {
                 return Err(
@@ -2371,27 +2303,6 @@ impl Loader {
                 )
             }
         })
-    }
-
-    fn count_type_nodes(&self, ty: &Type) -> usize {
-        let mut todo = vec![ty];
-        let mut result = 0;
-        while let Some(ty) = todo.pop() {
-            match ty {
-                Type::Vector(ty) | Type::Reference(ty) | Type::MutableReference(ty) => {
-                    result += 1;
-                    todo.push(ty);
-                }
-                Type::StructInstantiation(_, ty_args) => {
-                    result += 1;
-                    todo.extend(ty_args.iter())
-                }
-                _ => {
-                    result += 1;
-                }
-            }
-        }
-        result
     }
 
     fn struct_gidx_to_type_layout(
@@ -2418,20 +2329,7 @@ impl Loader {
             .iter()
             .map(|ty| self.type_to_type_layout_impl(ty, depth + 1))
             .collect::<PartialVMResult<Vec<_>>>()?;
-
-        let struct_layout = if self.runtime_config.paranoid_type_checks {
-            MoveStructLayout::CheckedRuntime {
-                fields: field_layouts,
-                tag: if ty_args.is_empty() {
-                    Type::Struct(gidx)
-                } else {
-                    Type::StructInstantiation(gidx, ty_args.to_vec())
-                }
-                .get_hash(),
-            }
-        } else {
-            MoveStructLayout::Runtime(field_layouts)
-        };
+        let struct_layout = MoveStructLayout::new(field_layouts);
 
         self.type_cache
             .write()
@@ -2443,35 +2341,6 @@ impl Loader {
             .struct_layout = Some(struct_layout.clone());
 
         Ok(struct_layout)
-    }
-
-    fn type_to_type_layout_impl(&self, ty: &Type, depth: usize) -> PartialVMResult<MoveTypeLayout> {
-        if depth > VALUE_DEPTH_MAX {
-            return Err(PartialVMError::new(StatusCode::VM_MAX_VALUE_DEPTH_REACHED));
-        }
-        Ok(match ty {
-            Type::Bool => MoveTypeLayout::Bool,
-            Type::U8 => MoveTypeLayout::U8,
-            Type::U64 => MoveTypeLayout::U64,
-            Type::U128 => MoveTypeLayout::U128,
-            Type::Address => MoveTypeLayout::Address,
-            Type::Signer => MoveTypeLayout::Signer,
-            Type::Vector(ty) => {
-                MoveTypeLayout::Vector(Box::new(self.type_to_type_layout_impl(ty, depth + 1)?))
-            }
-            Type::Struct(gidx) => {
-                MoveTypeLayout::Struct(self.struct_gidx_to_type_layout(*gidx, &[], depth)?)
-            }
-            Type::StructInstantiation(gidx, ty_args) => {
-                MoveTypeLayout::Struct(self.struct_gidx_to_type_layout(*gidx, ty_args, depth)?)
-            }
-            Type::Reference(_) | Type::MutableReference(_) | Type::TyParam(_) => {
-                return Err(
-                    PartialVMError::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR)
-                        .with_message(format!("no type layout for {:?}", ty)),
-                )
-            }
-        })
     }
 
     fn reference_type_to_type_layout_impl(
@@ -2493,11 +2362,135 @@ impl Loader {
         })
     }
 
+    fn type_to_type_layout_impl(&self, ty: &Type, depth: usize) -> PartialVMResult<MoveTypeLayout> {
+        if depth > VALUE_DEPTH_MAX {
+            return Err(PartialVMError::new(StatusCode::VM_MAX_VALUE_DEPTH_REACHED));
+        }
+        Ok(match ty {
+            Type::Bool => MoveTypeLayout::Bool,
+            Type::U8 => MoveTypeLayout::U8,
+            Type::U16 => MoveTypeLayout::U16,
+            Type::U32 => MoveTypeLayout::U32,
+            Type::U64 => MoveTypeLayout::U64,
+            Type::U128 => MoveTypeLayout::U128,
+            Type::U256 => MoveTypeLayout::U256,
+            Type::Address => MoveTypeLayout::Address,
+            Type::Signer => MoveTypeLayout::Signer,
+            Type::Vector(ty) => {
+                MoveTypeLayout::Vector(Box::new(self.type_to_type_layout_impl(ty, depth + 1)?))
+            }
+            Type::Struct(gidx) => {
+                MoveTypeLayout::Struct(self.struct_gidx_to_type_layout(*gidx, &[], depth)?)
+            }
+            Type::StructInstantiation(gidx, ty_args) => {
+                MoveTypeLayout::Struct(self.struct_gidx_to_type_layout(*gidx, ty_args, depth)?)
+            }
+            Type::Reference(_) | Type::MutableReference(_) | Type::TyParam(_) => {
+                return Err(
+                    PartialVMError::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR)
+                        .with_message(format!("no type layout for {:?}", ty)),
+                )
+            }
+        })
+    }
+
+    fn struct_gidx_to_fully_annotated_layout(
+        &self,
+        gidx: CachedStructIndex,
+        ty_args: &[Type],
+        depth: usize,
+    ) -> PartialVMResult<MoveStructLayout> {
+        if let Some(struct_map) = self.type_cache.read().structs.get(&gidx) {
+            if let Some(struct_info) = struct_map.get(ty_args) {
+                if let Some(layout) = &struct_info.annotated_struct_layout {
+                    return Ok(layout.clone());
+                }
+            }
+        }
+
+        let struct_type = self.module_cache.read().struct_at(gidx);
+        if struct_type.fields.len() != struct_type.field_names.len() {
+            return Err(
+                PartialVMError::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR).with_message(
+                    "Field types did not match the length of field names in loaded struct"
+                        .to_owned(),
+                ),
+            );
+        }
+        let struct_tag = self.struct_gidx_to_type_tag(gidx, ty_args)?;
+        let field_layouts = struct_type
+            .field_names
+            .iter()
+            .zip(&struct_type.fields)
+            .map(|(n, ty)| {
+                let ty = ty.subst(ty_args)?;
+                let l = self.type_to_fully_annotated_layout_impl(&ty, depth + 1)?;
+                Ok(MoveFieldLayout::new(n.clone(), l))
+            })
+            .collect::<PartialVMResult<Vec<_>>>()?;
+        let struct_layout = MoveStructLayout::with_types(struct_tag, field_layouts);
+
+        self.type_cache
+            .write()
+            .structs
+            .entry(gidx)
+            .or_insert_with(HashMap::new)
+            .entry(ty_args.to_vec())
+            .or_insert_with(StructInfo::new)
+            .annotated_struct_layout = Some(struct_layout.clone());
+
+        Ok(struct_layout)
+    }
+
+    fn type_to_fully_annotated_layout_impl(
+        &self,
+        ty: &Type,
+        depth: usize,
+    ) -> PartialVMResult<MoveTypeLayout> {
+        if depth > VALUE_DEPTH_MAX {
+            return Err(PartialVMError::new(StatusCode::VM_MAX_VALUE_DEPTH_REACHED));
+        }
+        Ok(match ty {
+            Type::Bool => MoveTypeLayout::Bool,
+            Type::U8 => MoveTypeLayout::U8,
+            Type::U16 => MoveTypeLayout::U16,
+            Type::U32 => MoveTypeLayout::U32,
+            Type::U64 => MoveTypeLayout::U64,
+            Type::U128 => MoveTypeLayout::U128,
+            Type::U256 => MoveTypeLayout::U256,
+            Type::Address => MoveTypeLayout::Address,
+            Type::Signer => MoveTypeLayout::Signer,
+            Type::Vector(ty) => MoveTypeLayout::Vector(Box::new(
+                self.type_to_fully_annotated_layout_impl(ty, depth + 1)?,
+            )),
+            Type::Struct(gidx) => MoveTypeLayout::Struct(
+                self.struct_gidx_to_fully_annotated_layout(*gidx, &[], depth)?,
+            ),
+            Type::StructInstantiation(gidx, ty_args) => MoveTypeLayout::Struct(
+                self.struct_gidx_to_fully_annotated_layout(*gidx, ty_args, depth)?,
+            ),
+            Type::Reference(_) | Type::MutableReference(_) | Type::TyParam(_) => {
+                return Err(
+                    PartialVMError::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR)
+                        .with_message(format!("no type layout for {:?}", ty)),
+                )
+            }
+        })
+    }
+
     pub(crate) fn type_to_type_tag(&self, ty: &Type) -> PartialVMResult<TypeTag> {
         self.type_to_type_tag_impl(ty)
     }
+
     pub(crate) fn type_to_type_layout(&self, ty: &Type) -> PartialVMResult<MoveTypeLayout> {
         self.type_to_type_layout_impl(ty, 1)
+    }
+
+    pub(crate) fn type_to_fully_annotated_layout(
+        &self,
+        ty: &Type,
+    ) -> PartialVMResult<MoveTypeLayout> {
+        self.type_to_fully_annotated_layout_impl(ty, 1)
     }
 
     pub(crate) fn reference_type_to_type_layout(
@@ -2505,10 +2498,6 @@ impl Loader {
         ty: &Type,
     ) -> PartialVMResult<MoveTypeLayout> {
         self.reference_type_to_type_layout_impl(ty, 1)
-    }
-
-    pub(crate) fn runtime_config(&self) -> RuntimeConfig {
-        self.runtime_config
     }
 }
 
@@ -2521,6 +2510,16 @@ impl Loader {
     ) -> VMResult<MoveTypeLayout> {
         let ty = self.load_type(type_tag, move_storage)?;
         self.type_to_type_layout(&ty)
+            .map_err(|e| e.finish(Location::Undefined))
+    }
+
+    pub(crate) fn get_fully_annotated_type_layout(
+        &self,
+        type_tag: &TypeTag,
+        move_storage: &impl DataStore,
+    ) -> VMResult<MoveTypeLayout> {
+        let ty = self.load_type(type_tag, move_storage)?;
+        self.type_to_fully_annotated_layout(&ty)
             .map_err(|e| e.finish(Location::Undefined))
     }
 }

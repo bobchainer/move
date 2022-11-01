@@ -14,8 +14,11 @@ use std::iter::Peekable;
 #[derive(Eq, PartialEq, Debug)]
 enum Token {
     U8Type,
+    U16Type,
+    U32Type,
     U64Type,
     U128Type,
+    U256Type,
     BoolType,
     AddressType,
     VectorType,
@@ -24,8 +27,12 @@ enum Token {
     Name(String),
     Address(String),
     U8(String),
+    U16(String),
+    U32(String),
     U64(String),
     U128(String),
+    U256(String),
+
     Bytes(String),
     True,
     False,
@@ -45,8 +52,11 @@ impl Token {
 fn name_token(s: String) -> Token {
     match s.as_str() {
         "u8" => Token::U8Type,
+        "u16" => Token::U16Type,
+        "u32" => Token::U32Type,
         "u64" => Token::U64Type,
         "u128" => Token::U128Type,
+        "u256" => Token::U256Type,
         "bool" => Token::BoolType,
         "address" => Token::AddressType,
         "vector" => Token::VectorType,
@@ -62,7 +72,7 @@ fn next_number(initial: char, mut it: impl Iterator<Item = char>) -> Result<(Tok
     num.push(initial);
     loop {
         match it.next() {
-            Some(c) if c.is_ascii_digit() => num.push(c),
+            Some(c) if c.is_ascii_digit() || c == '_' => num.push(c),
             Some(c) if c.is_alphanumeric() => {
                 let mut suffix = String::new();
                 suffix.push(c);
@@ -73,8 +83,11 @@ fn next_number(initial: char, mut it: impl Iterator<Item = char>) -> Result<(Tok
                             let len = num.len() + suffix.len();
                             let tok = match suffix.as_str() {
                                 "u8" => Token::U8(num),
+                                "u16" => Token::U16(num),
+                                "u32" => Token::U32(num),
                                 "u64" => Token::U64(num),
                                 "u128" => Token::U128(num),
+                                "u256" => Token::U256(num),
                                 _ => bail!("invalid suffix"),
                             };
                             return Ok((tok, len));
@@ -254,11 +267,7 @@ impl<I: Iterator<Item = Token>> Parser<I> {
         })
     }
 
-    fn parse_type_tag(&mut self, depth: u8) -> Result<TypeTag> {
-        if depth >= crate::safe_serialize::MAX_TYPE_TAG_NESTING {
-            bail!("Exceeded TypeTag nesting limit during parsing: {}", depth);
-        }
-
+    fn parse_type_tag(&mut self) -> Result<TypeTag> {
         Ok(match self.next()? {
             Token::U8Type => TypeTag::U8,
             Token::U64Type => TypeTag::U64,
@@ -268,7 +277,7 @@ impl<I: Iterator<Item = Token>> Parser<I> {
             Token::SignerType => TypeTag::Signer,
             Token::VectorType => {
                 self.consume(Token::Lt)?;
-                let ty = self.parse_type_tag(depth + 1)?;
+                let ty = self.parse_type_tag()?;
                 self.consume(Token::Gt)?;
                 TypeTag::Vector(Box::new(ty))
             }
@@ -282,7 +291,7 @@ impl<I: Iterator<Item = Token>> Parser<I> {
                                 let ty_args = if self.peek() == Some(&Token::Lt) {
                                     self.next()?;
                                     let ty_args = self.parse_comma_list(
-                                        |parser| parser.parse_type_tag(depth + 1),
+                                        |parser| parser.parse_type_tag(),
                                         Token::Gt,
                                         true,
                                     )?;
@@ -291,12 +300,12 @@ impl<I: Iterator<Item = Token>> Parser<I> {
                                 } else {
                                     vec![]
                                 };
-                                TypeTag::Struct(Box::new(StructTag {
+                                TypeTag::Struct(StructTag {
                                     address: AccountAddress::from_hex_literal(&addr)?,
                                     module: Identifier::new(module)?,
                                     name: Identifier::new(name)?,
                                     type_params: ty_args,
-                                }))
+                                })
                             }
                             t => bail!("expected name, got {:?}", t),
                         }
@@ -310,9 +319,12 @@ impl<I: Iterator<Item = Token>> Parser<I> {
 
     fn parse_transaction_argument(&mut self) -> Result<TransactionArgument> {
         Ok(match self.next()? {
-            Token::U8(s) => TransactionArgument::U8(s.parse()?),
-            Token::U64(s) => TransactionArgument::U64(s.parse()?),
-            Token::U128(s) => TransactionArgument::U128(s.parse()?),
+            Token::U8(s) => TransactionArgument::U8(s.replace('_', "").parse()?),
+            Token::U16(s) => TransactionArgument::U16(s.replace('_', "").parse()?),
+            Token::U32(s) => TransactionArgument::U32(s.replace('_', "").parse()?),
+            Token::U64(s) => TransactionArgument::U64(s.replace('_', "").parse()?),
+            Token::U128(s) => TransactionArgument::U128(s.replace('_', "").parse()?),
+            Token::U256(s) => TransactionArgument::U256(s.replace('_', "").parse()?),
             Token::True => TransactionArgument::Bool(true),
             Token::False => TransactionArgument::Bool(false),
             Token::Address(addr) => {
@@ -347,12 +359,12 @@ pub fn parse_string_list(s: &str) -> Result<Vec<String>> {
 
 pub fn parse_type_tags(s: &str) -> Result<Vec<TypeTag>> {
     parse(s, |parser| {
-        parser.parse_comma_list(|parser| parser.parse_type_tag(0), Token::EOF, true)
+        parser.parse_comma_list(|parser| parser.parse_type_tag(), Token::EOF, true)
     })
 }
 
 pub fn parse_type_tag(s: &str) -> Result<TypeTag> {
-    parse(s, |parser| parser.parse_type_tag(0))
+    parse(s, |parser| parser.parse_type_tag())
 }
 
 pub fn parse_transaction_arguments(s: &str) -> Result<Vec<TransactionArgument>> {
@@ -370,10 +382,10 @@ pub fn parse_transaction_argument(s: &str) -> Result<TransactionArgument> {
 }
 
 pub fn parse_struct_tag(s: &str) -> Result<StructTag> {
-    let type_tag = parse(s, |parser| parser.parse_type_tag(0))
+    let type_tag = parse(s, |parser| parser.parse_type_tag())
         .map_err(|e| format_err!("invalid struct tag: {}, {}", s, e))?;
     if let TypeTag::Struct(struct_tag) = type_tag {
-        Ok(*struct_tag)
+        Ok(struct_tag)
     } else {
         bail!("invalid struct tag: {}", s)
     }
@@ -402,6 +414,13 @@ mod tests {
             ("18446744073709551615", T::U64(18446744073709551615)),
             ("18446744073709551615u64", T::U64(18446744073709551615)),
             ("0u128", T::U128(0)),
+            ("1_0u8", T::U8(1_0)),
+            ("10_u8", T::U8(10)),
+            ("10___u8", T::U8(10)),
+            ("1_000u64", T::U64(1_000)),
+            ("1_000", T::U64(1_000)),
+            ("1_0_0_0u64", T::U64(1_000)),
+            ("1_000_000u128", T::U128(1_000_000)),
             (
                 "340282366920938463463374607431768211455u128",
                 T::U128(340282366920938463463374607431768211455),
@@ -431,15 +450,24 @@ mod tests {
 
     #[test]
     fn tests_parse_transaction_argument_negative() {
-        for s in &[
+        /// Test cases for the parser that should always fail.
+        const PARSE_VALUE_NEGATIVE_TEST_CASES: &[&str] = &[
             "-3",
             "0u42",
             "0u645",
             "0u64x",
             "0u6 4",
             "0u",
+            "_10",
+            "_10_u8",
+            "_10__u8",
+            "10_u8__",
+            "_",
+            "__",
+            "__4",
+            "_u8",
+            "5_bool",
             "256u8",
-            "18446744073709551616",
             "18446744073709551616u64",
             "340282366920938463463374607431768211456u128",
             "0xg",
@@ -447,6 +475,8 @@ mod tests {
             "0x",
             "0x_",
             "",
+            "@@",
+            "()",
             "x\"ffff",
             "x\"a \"",
             "x\" \"",
@@ -457,8 +487,14 @@ mod tests {
             "3false",
             "3 false",
             "",
-        ] {
-            assert!(parse_transaction_argument(s).is_err())
+        ];
+
+        for s in PARSE_VALUE_NEGATIVE_TEST_CASES {
+            assert!(
+                parse_transaction_argument(s).is_err(),
+                "test case unexpectedly succeeded: {}",
+                s
+            )
         }
     }
 
@@ -469,7 +505,6 @@ mod tests {
             "bool",
             "vector<u8>",
             "vector<vector<u64>>",
-            "vector<vector<vector<vector<vector<vector<vector<u64>>>>>>>",
             "signer",
             "0x1::M::S",
             "0x2::M::S_",
@@ -485,14 +520,6 @@ mod tests {
         ] {
             assert!(parse_type_tag(s).is_ok(), "Failed to parse tag {}", s);
         }
-
-        let s =
-            "vector<vector<vector<vector<vector<vector<vector<vector<vector<vector<u64>>>>>>>>>>";
-        assert!(
-            parse_type_tag(s).is_err(),
-            "Should have failed to parse type tag {}",
-            s
-        );
     }
 
     #[test]
@@ -518,7 +545,6 @@ mod tests {
             "0x1::Diem::Diem<u8 , bool  ,    vector<u8>,address,signer>",
             "0x1::Diem::Diem<vector<0x1::Diem::Struct<0x1::XUS::XUS>>>",
             "0x1::Diem::Diem<0x1::Diem::Struct<vector<0x1::XUS::XUS>, 0x1::Diem::Diem<vector<0x1::Diem::Struct<0x1::XUS::XUS>>>>>",
-            "0x1::Diem::Diem<vector<0x1::XDX::XDX<vector<vector<vector<0x1::XDX::XDX<vector<u64>>>>>>>>",
         ];
         for text in valid {
             let st = parse_struct_tag(text).expect("valid StructTag");
@@ -530,12 +556,5 @@ mod tests {
                 st
             );
         }
-
-        let s = "0x1::Diem::Diem<vector<0x1::XDX::XDX<vector<vector<vector<0x1::XDX::XDX<vector<vector<u64>>>>>>>>>";
-        assert!(
-            parse_struct_tag(s).is_err(),
-            "Should have failed to parse type tag {}",
-            s
-        );
     }
 }

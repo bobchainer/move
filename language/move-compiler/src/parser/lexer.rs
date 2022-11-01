@@ -560,7 +560,7 @@ fn get_name_len(text: &str) -> usize {
 fn get_decimal_number(text: &str) -> (Tok, usize) {
     let num_text_len = text
         .chars()
-        .position(|c| !matches!(c, '0'..='9'))
+        .position(|c| !matches!(c, '0'..='9' | '_'))
         .unwrap_or(text.len());
     get_number_maybe_with_suffix(text, num_text_len)
 }
@@ -579,9 +579,9 @@ fn get_number_maybe_with_suffix(text: &str, num_text_len: usize) -> (Tok, usize)
     let rest = &text[num_text_len..];
     if rest.starts_with("u8") {
         (Tok::NumTypedValue, num_text_len + 2)
-    } else if rest.starts_with("u64") {
+    } else if rest.starts_with("u64") || rest.starts_with("u16") || rest.starts_with("u32") {
         (Tok::NumTypedValue, num_text_len + 3)
-    } else if rest.starts_with("u128") {
+    } else if rest.starts_with("u128") || rest.starts_with("u256") {
         (Tok::NumTypedValue, num_text_len + 4)
     } else {
         // No typed suffix

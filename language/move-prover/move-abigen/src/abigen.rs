@@ -268,8 +268,11 @@ impl<'env> Abigen<'env> {
                 match prim {
                     Bool => TypeTag::Bool,
                     U8 => TypeTag::U8,
+                    U16 => TypeTag::U16,
+                    U32 => TypeTag::U32,
                     U64 => TypeTag::U64,
                     U128 => TypeTag::U128,
+                    U256 => TypeTag::U256,
                     Address => TypeTag::Address,
                     Signer => TypeTag::Signer,
                     Num | Range | EventStore => {
@@ -289,7 +292,7 @@ impl<'env> Abigen<'env> {
                 let struct_module_env = module_env.env.get_module(*module_id);
                 let abilities = struct_module_env.get_struct(*struct_id).get_abilities();
                 if abilities.has_ability(Ability::Copy) && !abilities.has_ability(Ability::Key) {
-                    TypeTag::Struct(Box::new(StructTag {
+                    TypeTag::Struct(StructTag {
                         address: *struct_module_env.self_address(),
                         module: struct_module_env.get_identifier(),
                         name: struct_module_env
@@ -304,7 +307,7 @@ impl<'env> Abigen<'env> {
                             })
                             .map(|e| e.unwrap_or_else(|| panic!("{}", expect_msg)))
                             .collect(),
-                    }))
+                    })
                 } else {
                     return Ok(None);
                 }

@@ -10,16 +10,13 @@ use move_core_types::{
     gas_algebra::AbstractMemorySize, identifier::Identifier, language_storage::ModuleId,
     vm_status::StatusCode,
 };
-use std::{
-    collections::hash_map::DefaultHasher,
-    hash::{Hash, Hasher},
-};
 
 pub const TYPE_DEPTH_MAX: usize = 256;
 
 #[derive(Debug, Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct StructType {
     pub fields: Vec<Type>,
+    pub field_names: Vec<Identifier>,
     pub abilities: AbilitySet,
     pub type_parameters: Vec<StructTypeParameter>,
     pub name: Identifier,
@@ -40,8 +37,11 @@ pub struct CachedStructIndex(pub usize);
 pub enum Type {
     Bool,
     U8,
+    U16,
+    U32,
     U64,
     U128,
+    U256,
     Address,
     Signer,
     Vector(Box<Type>),
@@ -68,8 +68,11 @@ impl Type {
             Type::TyParam(idx) => subst(*idx, depth)?,
             Type::Bool => Type::Bool,
             Type::U8 => Type::U8,
+            Type::U16 => Type::U16,
+            Type::U32 => Type::U32,
             Type::U64 => Type::U64,
             Type::U128 => Type::U128,
+            Type::U256 => Type::U256,
             Type::Address => Type::Address,
             Type::Signer => Type::Signer,
             Type::Vector(ty) => Type::Vector(Box::new(ty.apply_subst(subst, depth + 1)?)),
@@ -117,7 +120,9 @@ impl Type {
         use Type::*;
 
         match self {
-            TyParam(_) | Bool | U8 | U64 | U128 | Address | Signer => Self::LEGACY_BASE_MEMORY_SIZE,
+            TyParam(_) | Bool | U8 | U16 | U32 | U64 | U128 | U256 | Address | Signer => {
+                Self::LEGACY_BASE_MEMORY_SIZE
+            }
             Vector(ty) | Reference(ty) | MutableReference(ty) => {
                 Self::LEGACY_BASE_MEMORY_SIZE + ty.size()
             }
@@ -126,15 +131,5 @@ impl Type {
                 .iter()
                 .fold(Self::LEGACY_BASE_MEMORY_SIZE, |acc, ty| acc + ty.size()),
         }
-    }
-
-    /// Get a u64 hash for the type.
-    ///
-    /// This is just used for generating unique identifier for types at runtime checks.
-    /// We may want to revisit if hash collision is really a concern here.
-    pub fn get_hash(&self) -> u64 {
-        let mut s = DefaultHasher::new();
-        self.hash(&mut s);
-        s.finish()
     }
 }

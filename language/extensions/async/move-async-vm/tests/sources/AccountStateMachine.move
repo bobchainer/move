@@ -22,13 +22,13 @@ module Test::AccountStateMachine {
     // const MAX_TRANSFER_AGE: u128 = 100000000;
 
     #[state]
-    struct Account has key {
+    struct Account {
         value: u64,
         xfer_id_counter: u64,
         pending: vector<PendingTransfer>
     }
 
-    struct PendingTransfer has store, drop {
+    struct PendingTransfer has drop {
        xfer_id: u64,
        amount: u64,
        initiated_at: u128,

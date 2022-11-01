@@ -18,12 +18,6 @@ use move_core_types::{
     metadata::Metadata, resolver::MoveResolver,
 };
 
-#[derive(Debug, Clone, Default, Copy)]
-pub struct RuntimeConfig {
-    pub paranoid_type_checks: bool,
-    pub paranoid_hot_potato_checks: bool,
-}
-
 pub struct MoveVM {
     runtime: VMRuntime,
 }
@@ -32,26 +26,19 @@ impl MoveVM {
     pub fn new(
         natives: impl IntoIterator<Item = (AccountAddress, Identifier, Identifier, NativeFunction)>,
     ) -> VMResult<Self> {
-        Self::new_with_configs(natives, VerifierConfig::default(), RuntimeConfig::default())
+        Self::new_with_verifier_config(natives, VerifierConfig::default())
     }
 
     pub fn new_with_verifier_config(
         natives: impl IntoIterator<Item = (AccountAddress, Identifier, Identifier, NativeFunction)>,
         verifier_config: VerifierConfig,
     ) -> VMResult<Self> {
-        Self::new_with_configs(natives, verifier_config, RuntimeConfig::default())
-    }
-
-    pub fn new_with_configs(
-        natives: impl IntoIterator<Item = (AccountAddress, Identifier, Identifier, NativeFunction)>,
-        verifier_config: VerifierConfig,
-        runtime_config: RuntimeConfig,
-    ) -> VMResult<Self> {
         Ok(Self {
-            runtime: VMRuntime::new(natives, verifier_config, runtime_config)
+            runtime: VMRuntime::new(natives, verifier_config)
                 .map_err(|err| err.finish(Location::Undefined))?,
         })
     }
+
     /// Create a new Session backed by the given storage.
     ///
     /// Right now it is the caller's responsibility to ensure cache coherence of the Move VM Loader
@@ -101,6 +88,12 @@ impl MoveVM {
     /// TODO: new loader architecture
     pub fn mark_loader_cache_as_invalid(&self) {
         self.runtime.loader().mark_as_invalid()
+    }
+
+    /// Returns true if the loader cache has been invalidated (either by explicit call above
+    /// or by the runtime)
+    pub fn is_loader_cache_invalidated(&self) -> bool {
+        self.runtime.loader().is_invalidated()
     }
 
     /// If the loader cache has been invalidated (either by the above call or by internal logic)

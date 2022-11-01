@@ -6,7 +6,7 @@
 module Test::Basic {
 
     #[state]
-    struct State has key {
+    struct State {
         value: u64,
     }
 

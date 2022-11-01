@@ -1,5 +1,5 @@
 module 0x2::A {
-    struct S has drop {
+    struct S {
         f1: bool,
         f2: u64,
     }

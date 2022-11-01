@@ -10,7 +10,7 @@
 
 mod abstract_state;
 
-use crate::absint::{AbstractInterpreter, BlockInvariant, BlockPostcondition, TransferFunctions};
+use crate::absint::{AbstractInterpreter, TransferFunctions};
 use abstract_state::{AbstractState, AbstractValue};
 use move_binary_format::{
     binary_views::{BinaryIndexedView, FunctionView},
@@ -53,16 +53,7 @@ pub(crate) fn verify<'a>(
     let initial_state = AbstractState::new(function_view);
 
     let mut verifier = ReferenceSafetyAnalysis::new(resolver, function_view, name_def_map);
-    let inv_map = verifier.analyze_function(initial_state, function_view);
-    // Report all the join failures
-    for (_block_id, BlockInvariant { post, .. }) in inv_map {
-        match post {
-            BlockPostcondition::Error(err) => return Err(err),
-            // Block might be unprocessed if all predecessors had an error
-            BlockPostcondition::Unprocessed | BlockPostcondition::Success => (),
-        }
-    }
-    Ok(())
+    verifier.analyze_function(initial_state, function_view)
 }
 
 fn call(
@@ -268,8 +259,11 @@ fn execute_inner(
         Bytecode::Branch(_)
         | Bytecode::Nop
         | Bytecode::CastU8
+        | Bytecode::CastU16
+        | Bytecode::CastU32
         | Bytecode::CastU64
         | Bytecode::CastU128
+        | Bytecode::CastU256
         | Bytecode::Not
         | Bytecode::Exists(_)
         | Bytecode::ExistsGeneric(_) => (),
@@ -288,8 +282,11 @@ fn execute_inner(
             verifier.stack.push(state.value_for(&SignatureToken::Bool))
         }
         Bytecode::LdU8(_) => verifier.stack.push(state.value_for(&SignatureToken::U8)),
+        Bytecode::LdU16(_) => verifier.stack.push(state.value_for(&SignatureToken::U16)),
+        Bytecode::LdU32(_) => verifier.stack.push(state.value_for(&SignatureToken::U32)),
         Bytecode::LdU64(_) => verifier.stack.push(state.value_for(&SignatureToken::U64)),
         Bytecode::LdU128(_) => verifier.stack.push(state.value_for(&SignatureToken::U128)),
+        Bytecode::LdU256(_) => verifier.stack.push(state.value_for(&SignatureToken::U256)),
         Bytecode::LdConst(idx) => {
             let signature = &verifier.resolver.constant_at(*idx).type_;
             verifier.stack.push(state.value_for(signature))
@@ -401,7 +398,6 @@ fn execute_inner(
 
 impl<'a> TransferFunctions for ReferenceSafetyAnalysis<'a> {
     type State = AbstractState;
-    type AnalysisError = PartialVMError;
 
     fn execute(
         &mut self,
@@ -409,7 +405,7 @@ impl<'a> TransferFunctions for ReferenceSafetyAnalysis<'a> {
         bytecode: &Bytecode,
         index: CodeOffset,
         last_index: CodeOffset,
-    ) -> Result<(), Self::AnalysisError> {
+    ) -> PartialVMResult<()> {
         execute_inner(self, state, bytecode, index)?;
         if index == last_index {
             assert!(self.stack.is_empty());

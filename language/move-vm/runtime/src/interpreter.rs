@@ -4,14 +4,13 @@
 
 use crate::{
     loader::{Function, Loader, Resolver},
-    move_vm::RuntimeConfig,
     native_functions::NativeContext,
     trace,
 };
 use fail::fail_point;
 use move_binary_format::{
     errors::*,
-    file_format::{AbilitySet, Bytecode, FunctionHandleIndex, FunctionInstantiationIndex},
+    file_format::{Bytecode, FunctionHandleIndex, FunctionInstantiationIndex},
 };
 use move_core_types::{
     account_address::AccountAddress,
@@ -32,9 +31,9 @@ use move_vm_types::{
 };
 
 use crate::native_extensions::NativeContextExtensions;
-use move_core_types::value::MoveTypeLayout;
-use std::{cmp::min, collections::VecDeque, fmt::Write, mem, sync::Arc};
+use std::{cmp::min, collections::VecDeque, fmt::Write, sync::Arc};
 use tracing::error;
+use move_core_types::value::MoveTypeLayout;
 
 macro_rules! debug_write {
     ($($toks: tt)*) => {
@@ -70,7 +69,6 @@ pub(crate) struct Interpreter {
     operand_stack: Stack,
     /// The stack of active functions.
     call_stack: CallStack,
-    runtime_config: RuntimeConfig,
     call_traces: Vec<CallTrace>,
 }
 
@@ -104,43 +102,15 @@ impl Interpreter {
     ) -> VMResult<InterpreterEntrypointResult> {
         // We count the intrinsic cost of the transaction here, since that needs to also cover the
         // setup of the function.
-        let mut interp = Self::new(loader.runtime_config());
+        let call_traces = vec![];
 
-        let values = interp.execute(
-            loader, data_store, gas_meter, extensions, function, ty_args, args,
-        );
-
-        Ok(InterpreterEntrypointResult {
-            values,
-            call_traces: interp.call_traces,
-        })
-    }
-
-    /// Create a new instance of an `Interpreter` in the context of a transaction with a
-    /// given module cache and gas schedule.
-    fn new(runtime_config: RuntimeConfig) -> Self {
-        Interpreter {
+        let interp = Interpreter {
             operand_stack: Stack::new(),
             call_stack: CallStack::new(),
-            call_traces: Vec::new(),
-            runtime_config,
-        }
-    }
+            call_traces
+        };
 
-    /// Internal execution entry point.
-    fn execute(
-        &mut self,
-        loader: &Loader,
-        data_store: &mut impl DataStore,
-        gas_meter: &mut impl GasMeter,
-        extensions: &mut NativeContextExtensions,
-        function: Arc<Function>,
-        ty_args: Vec<Type>,
-        args: Vec<Value>,
-    ) -> VMResult<Vec<Value>> {
-        // No unwinding of the call stack and value stack need to be done here -- the context will
-        // take care of that.
-        self.execute_main(
+        interp.execute_main(
             loader, data_store, gas_meter, extensions, function, ty_args, args,
         )
     }
@@ -151,10 +121,8 @@ impl Interpreter {
     /// function represented by the frame. Control comes back to this function on return or
     /// on call. When that happens the frame is changes to a new one (call) or to the one
     /// at the top of the stack (return). If the call stack is empty execution is completed.
-    // REVIEW: create account will be removed in favor of a native function (no opcode) and
-    // we can simplify this code quite a bit.
     fn execute_main(
-        &mut self,
+        mut self,
         loader: &Loader,
         data_store: &mut impl DataStore,
         gas_meter: &mut impl GasMeter,
@@ -162,18 +130,7 @@ impl Interpreter {
         function: Arc<Function>,
         ty_args: Vec<Type>,
         args: Vec<Value>,
-    ) -> VMResult<Vec<Value>> {
-        // A counter for tracking numbers of struct that don't have any capability.
-        // This counter will be incremented whenever a struct that has empty capability was created by pack and decremented on unpack.
-        //
-        // The invariant here is this counter should always goes to zero at the end of execution.
-        // The reason is that values with such capability can only be created by pack instruction and destructed by unpack
-        // instruction and can never be stored in storage.
-        //
-        // Thus if the counter is not zero towards the end of execution, it means that some hot potato values are silently dropped at runtime.
-
-        let mut hot_potato_counter: u64 = 0;
-
+    ) -> VMResult<InterpreterEntrypointResult> {
         let mut locals = Locals::new(function.local_count());
         for (i, value) in args.into_iter().enumerate() {
             locals
@@ -183,7 +140,7 @@ impl Interpreter {
 
         let gas_used_before_call = gas_meter.charged_already_total().unwrap();
 
-        let mut current_frame = Frame::new(function, ty_args, locals, self.runtime_config);
+        let mut current_frame = Frame::new(function, ty_args, locals);
 
         let (mut args_types, mut args_values) =
             current_frame.extract_types_and_arguments(loader, data_store);
@@ -219,23 +176,18 @@ impl Interpreter {
             };
 
             let resolver = current_frame.resolver(loader);
-            let exit_code = current_frame //self
-                .execute_code(
-                    &resolver,
-                    self,
-                    data_store,
-                    gas_meter,
-                    &mut hot_potato_counter,
-                )
-                .map_err(|err| {
-                    let gas_used_after_call = gas_meter.charged_already_total().unwrap();
-                    call_trace.err = Some(err.clone().into_vm_status());
-                    call_trace.gas_used = gas_used_after_call
-                        .checked_sub(gas_used_before_call)
-                        .unwrap()
-                        .into();
-                    self.maybe_core_dump(err, &current_frame)
-                })?;
+            let exit_code =
+                current_frame //self
+                    .execute_code(&resolver, &mut self, data_store, gas_meter)
+                    .map_err(|err| {
+                        let gas_used_after_call = gas_meter.charged_already_total().unwrap();
+                        call_trace.err = Some(err.clone().into_vm_status());
+                        call_trace.gas_used = gas_used_after_call
+                            .checked_sub(gas_used_before_call)
+                            .unwrap()
+                            .into();
+                        self.maybe_core_dump(err, &current_frame)
+                    })?;
 
             let gas_used_after_call = gas_meter.charged_already_total().unwrap();
             call_trace.gas_used = gas_used_after_call
@@ -247,30 +199,18 @@ impl Interpreter {
 
             match exit_code {
                 ExitCode::Return => {
-                    // TODO: Check if the error location is set correctly.
-                    gas_meter
-                        .charge_drop_frame(
-                            current_frame
-                                .locals
-                                .into_values()
-                                .map_err(|e| self.set_location(e))?
-                                .map(|(_idx, val)| val),
-                        )
-                        .map_err(|e| self.set_location(e))?;
-
                     if let Some(frame) = self.call_stack.pop() {
+                        // Note: the caller will find the callee's return values at the top of the shared operand stack
                         current_frame = frame;
                         current_frame.pc += 1; // advance past the Call instruction in the caller
                     } else {
-                        if self.runtime_config.paranoid_hot_potato_checks && hot_potato_counter != 0
-                        {
-                            return Err(self.set_location(
-                                PartialVMError::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR)
-                                    .with_message("Dropping unexpected structs".to_string()),
-                            ));
-                        }
-
-                        return Ok(mem::take(&mut self.operand_stack.0));
+                        // end of execution. `self` should no longer be used afterward
+                        return Ok(
+                            InterpreterEntrypointResult {
+                                values: Ok(self.operand_stack.0),
+                                call_traces: self.call_traces
+                            }
+                        )
                     }
                 }
                 ExitCode::Call(fh_idx) => {
@@ -291,16 +231,10 @@ impl Interpreter {
                             self.operand_stack
                                 .last_n(func.arg_count())
                                 .map_err(|e| set_err_info!(current_frame, e))?,
-                            (func.local_count() as u64).into(),
                         )
                         .map_err(|e| set_err_info!(current_frame, e))?;
 
-                    if self.runtime_config.paranoid_type_checks {
-                        self.check_friend_or_private_call(&current_frame.function, &func)?;
-                    }
-
                     if func.is_native() {
-                        let resolver = func.get_resolver(loader);
                         self.call_native(
                             &resolver,
                             data_store,
@@ -312,9 +246,8 @@ impl Interpreter {
                         current_frame.pc += 1; // advance past the Call instruction in the caller
                         continue;
                     }
-
                     let frame = self
-                        .make_call_frame(func, vec![], loader)
+                        .make_call_frame(func, vec![])
                         .map_err(|err| self.maybe_core_dump(err, &current_frame))?;
 
                     (args_types, args_values) =
@@ -325,7 +258,7 @@ impl Interpreter {
                         let err = set_err_info!(frame, err);
                         self.maybe_core_dump(err, &frame)
                     })?;
-
+                    // Note: the caller will find the the callee's return values at the top of the shared operand stack
                     current_frame = frame;
                 }
                 ExitCode::CallGeneric(idx) => {
@@ -351,16 +284,10 @@ impl Interpreter {
                             self.operand_stack
                                 .last_n(func.arg_count())
                                 .map_err(|e| set_err_info!(current_frame, e))?,
-                            (func.local_count() as u64).into(),
                         )
                         .map_err(|e| set_err_info!(current_frame, e))?;
 
-                    if self.runtime_config.paranoid_type_checks {
-                        self.check_friend_or_private_call(&current_frame.function, &func)?;
-                    }
-
                     if func.is_native() {
-                        let resolver = func.get_resolver(loader);
                         self.call_native(
                             &resolver, data_store, gas_meter, extensions, func, ty_args,
                         )?;
@@ -368,7 +295,7 @@ impl Interpreter {
                         continue;
                     }
                     let frame = self
-                        .make_call_frame(func, ty_args, loader)
+                        .make_call_frame(func, ty_args)
                         .map_err(|err| self.maybe_core_dump(err, &current_frame))?;
 
                     (args_types, args_values) =
@@ -379,42 +306,9 @@ impl Interpreter {
                         let err = set_err_info!(frame, err);
                         self.maybe_core_dump(err, &frame)
                     })?;
-
                     current_frame = frame;
                 }
             }
-        }
-    }
-
-    /// Make sure only private/friend function can only be invoked by modules under the same address.
-    fn check_friend_or_private_call(
-        &self,
-        caller: &Arc<Function>,
-        callee: &Arc<Function>,
-    ) -> VMResult<()> {
-        if callee.is_friend_or_private() {
-            match (caller.module_id(), callee.module_id()) {
-                (Some(caller_id), Some(callee_id)) => {
-                    if caller_id.address() == callee_id.address() {
-                        Ok(())
-                    } else {
-                        Err(self.set_location(PartialVMError::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR)
-                            .with_message(
-                                format!("Private/Friend function invokation error, caller: {:?}::{:?}, callee: {:?}::{:?}", caller_id, caller.name(), callee_id, callee.name()),
-                            )))
-                    }
-                }
-                _ => Err(self.set_location(
-                    PartialVMError::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR)
-                        .with_message(format!(
-                            "Private/Friend function invokation error caller: {:?}, callee {:?}",
-                            caller.name(),
-                            callee.name()
-                        )),
-                )),
-            }
-        } else {
-            Ok(())
         }
     }
 
@@ -423,45 +317,18 @@ impl Interpreter {
     ///
     /// Native functions do not push a frame at the moment and as such errors from a native
     /// function are incorrectly attributed to the caller.
-    fn make_call_frame(
-        &mut self,
-        func: Arc<Function>,
-        ty_args: Vec<Type>,
-        loader: &Loader,
-    ) -> VMResult<Frame> {
-        let resolver = func.get_resolver(loader);
+    fn make_call_frame(&mut self, func: Arc<Function>, ty_args: Vec<Type>) -> VMResult<Frame> {
         let mut locals = Locals::new(func.local_count());
         let arg_count = func.arg_count();
         for i in 0..arg_count {
-            let v = self.operand_stack.pop().map_err(|e| self.set_location(e))?;
-            if self.runtime_config.paranoid_type_checks {
-                let expected_ty = resolver
-                    .resolve_signature_token(&func.local_types()[arg_count - i - 1])
-                    .and_then(|ty| ty.subst(&ty_args))
-                    .map_err(|e| match func.module_id() {
-                        Some(id) => e
-                            .at_code_offset(func.index(), 0)
-                            .finish(Location::Module(id.clone())),
-                        None => {
-                            let err =
-                                PartialVMError::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR)
-                                    .with_message(
-                                        "Unexpected native function not located in a module"
-                                            .to_owned(),
-                                    );
-                            self.set_location(err)
-                        }
-                    })?;
-
-                v.check_type(&expected_ty)
-                    .map_err(|e| self.set_location(e))?;
-            }
-
             locals
-                .store_loc(arg_count - i - 1, v)
+                .store_loc(
+                    arg_count - i - 1,
+                    self.operand_stack.pop().map_err(|e| self.set_location(e))?,
+                )
                 .map_err(|e| self.set_location(e))?;
         }
-        Ok(Frame::new(func, ty_args, locals, self.runtime_config))
+        Ok(Frame::new(func, ty_args, locals))
     }
 
     /// Call a native functions.
@@ -504,6 +371,7 @@ impl Interpreter {
         function: Arc<Function>,
         ty_args: Vec<Type>,
     ) -> PartialVMResult<()> {
+        let return_type_count = function.return_type_count();
         let mut args = VecDeque::new();
         let expected_args = function.arg_count();
         for _ in 0..expected_args {
@@ -512,49 +380,27 @@ impl Interpreter {
         let mut native_context = NativeContext::new(self, data_store, resolver, extensions);
         let native_function = function.get_native()?;
 
-        gas_meter.charge_native_function_before_execution(
-            ty_args.iter().map(|ty| TypeWithLoader {
-                ty,
-                loader: resolver.loader(),
-            }),
-            args.iter(),
-        )?;
+        let result = native_function(&mut native_context, ty_args, args)?;
+        gas_meter.charge_native_function(result.cost)?;
 
-        let result = native_function(&mut native_context, ty_args.clone(), args)?;
-
-        // Note(Gas): The order by which gas is charged / error gets returned MUST NOT be modified
-        //            here or otherwise it becomes an incompatible change!!!
-        let return_values = match result.result {
-            Ok(vals) => {
-                gas_meter.charge_native_function(result.cost, Some(vals.iter()))?;
-                vals
-            }
-            Err(code) => {
-                gas_meter.charge_native_function(
-                    result.cost,
-                    Option::<std::iter::Empty<&Value>>::None,
-                )?;
-                return Err(PartialVMError::new(StatusCode::ABORTED).with_sub_status(code));
-            }
-        };
-
-        if self.runtime_config.paranoid_type_checks {
-            if return_values.len() != function.return_types().len() {
-                return Err(
-                    PartialVMError::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR)
-                        .with_message(
-                            "Unexpected native function not located in a module".to_owned(),
-                        ),
-                );
-            }
-            for (value, sig) in return_values.into_iter().zip(function.return_types()) {
-                value.add_runtime_type(&resolver.resolve_signature_token(sig)?.subst(&ty_args)?)?;
-                self.operand_stack.push(value)?;
-            }
-        } else {
-            for value in return_values {
-                self.operand_stack.push(value)?;
-            }
+        let return_values = result
+            .result
+            .map_err(|code| PartialVMError::new(StatusCode::ABORTED).with_sub_status(code))?;
+        // Paranoid check to protect us against incorrect native function implementations. A native function that
+        // returns a different number of values than its declared types will trigger this check
+        if return_values.len() != return_type_count {
+            return Err(
+                PartialVMError::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR).with_message(
+                    "Arity mismatch: return value count does not match return type count"
+                        .to_string(),
+                ),
+            );
+        }
+        // Put return values on the top of the operand stack, where the caller will find them.
+        // This is one of only two times the operand stack is shared across call stack frames; the other is in handling
+        // the Return instruction for normal calls
+        for value in return_values {
+            self.operand_stack.push(value)?;
         }
         Ok(())
     }
@@ -579,8 +425,11 @@ impl Interpreter {
         self.binop(|lhs, rhs| {
             Ok(match f(lhs, rhs)? {
                 IntegerValue::U8(x) => Value::u8(x),
+                IntegerValue::U16(x) => Value::u16(x),
+                IntegerValue::U32(x) => Value::u32(x),
                 IntegerValue::U64(x) => Value::u64(x),
                 IntegerValue::U128(x) => Value::u128(x),
+                IntegerValue::U256(x) => Value::u256(x),
             })
         })
     }
@@ -604,20 +453,7 @@ impl Interpreter {
         match data_store.load_resource(addr, ty) {
             Ok((gv, load_res)) => {
                 if let Some(loaded) = load_res {
-                    let opt = match loaded {
-                        Some(num_bytes) => {
-                            let view = gv.view().ok_or_else(|| {
-                                PartialVMError::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR)
-                                    .with_message(
-                                        "Failed to create view for global value".to_owned(),
-                                    )
-                            })?;
-
-                            Some((num_bytes, view))
-                        }
-                        None => None,
-                    };
-                    gas_meter.charge_load_resource(opt)?;
+                    gas_meter.charge_load_resource(loaded)?;
                 }
                 Ok(gv)
             }
@@ -1027,7 +863,6 @@ struct Frame {
     locals: Locals,
     function: Arc<Function>,
     ty_args: Vec<Type>,
-    runtime_config: RuntimeConfig,
 }
 
 /// An `ExitCode` from `execute_code_unit`.
@@ -1042,18 +877,12 @@ impl Frame {
     /// Create a new `Frame` given a `Function` and the function `Locals`.
     ///
     /// The locals must be loaded before calling this.
-    fn new(
-        function: Arc<Function>,
-        ty_args: Vec<Type>,
-        locals: Locals,
-        runtime_config: RuntimeConfig,
-    ) -> Self {
+    fn new(function: Arc<Function>, ty_args: Vec<Type>, locals: Locals) -> Self {
         Frame {
             pc: 0,
             locals,
             function,
             ty_args,
-            runtime_config,
         }
     }
 
@@ -1064,19 +893,12 @@ impl Frame {
         interpreter: &mut Interpreter,
         data_store: &mut impl DataStore,
         gas_meter: &mut impl GasMeter,
-        hot_potato_counter: &mut u64,
     ) -> VMResult<ExitCode> {
-        self.execute_code_impl(
-            resolver,
-            interpreter,
-            data_store,
-            gas_meter,
-            hot_potato_counter,
-        )
-        .map_err(|e| {
-            e.at_code_offset(self.function.index(), self.pc)
-                .finish(self.location())
-        })
+        self.execute_code_impl(resolver, interpreter, data_store, gas_meter)
+            .map_err(|e| {
+                e.at_code_offset(self.function.index(), self.pc)
+                    .finish(self.location())
+            })
     }
 
     fn execute_code_impl(
@@ -1085,7 +907,6 @@ impl Frame {
         interpreter: &mut Interpreter,
         data_store: &mut impl DataStore,
         gas_meter: &mut impl GasMeter,
-        hot_potato_counter: &mut u64,
     ) -> PartialVMResult<ExitCode> {
         use SimpleInstruction as S;
 
@@ -1120,8 +941,8 @@ impl Frame {
 
                 match instruction {
                     Bytecode::Pop => {
-                        let popped_val = interpreter.operand_stack.pop()?;
-                        gas_meter.charge_pop(popped_val)?;
+                        gas_meter.charge_simple_instr(S::Pop)?;
+                        interpreter.operand_stack.pop()?;
                     }
                     Bytecode::Ret => {
                         gas_meter.charge_simple_instr(S::Ret)?;
@@ -1150,6 +971,14 @@ impl Frame {
                         gas_meter.charge_simple_instr(S::LdU8)?;
                         interpreter.operand_stack.push(Value::u8(*int_const))?;
                     }
+                    Bytecode::LdU16(int_const) => {
+                        gas_meter.charge_simple_instr(S::LdU16)?;
+                        interpreter.operand_stack.push(Value::u16(*int_const))?;
+                    }
+                    Bytecode::LdU32(int_const) => {
+                        gas_meter.charge_simple_instr(S::LdU32)?;
+                        interpreter.operand_stack.push(Value::u32(*int_const))?;
+                    }
                     Bytecode::LdU64(int_const) => {
                         gas_meter.charge_simple_instr(S::LdU64)?;
                         interpreter.operand_stack.push(Value::u64(*int_const))?;
@@ -1158,21 +987,22 @@ impl Frame {
                         gas_meter.charge_simple_instr(S::LdU128)?;
                         interpreter.operand_stack.push(Value::u128(*int_const))?;
                     }
+                    Bytecode::LdU256(int_const) => {
+                        gas_meter.charge_simple_instr(S::LdU256)?;
+                        interpreter.operand_stack.push(Value::u256(*int_const))?;
+                    }
                     Bytecode::LdConst(idx) => {
                         let constant = resolver.constant_at(*idx);
                         gas_meter.charge_ld_const(NumBytes::new(constant.data.len() as u64))?;
-
-                        let val = Value::deserialize_constant(constant).ok_or_else(|| {
-                            PartialVMError::new(StatusCode::VERIFIER_INVARIANT_VIOLATION)
-                                .with_message(
+                        interpreter.operand_stack.push(
+                            Value::deserialize_constant(constant).ok_or_else(|| {
+                                PartialVMError::new(StatusCode::VERIFIER_INVARIANT_VIOLATION)
+                                    .with_message(
                                     "Verifier failed to verify the deserialization of constants"
                                         .to_owned(),
                                 )
-                        })?;
-
-                        gas_meter.charge_ld_const_after_deserialization(&val)?;
-
-                        interpreter.operand_stack.push(val)?
+                            })?,
+                        )?
                     }
                     Bytecode::LdTrue => {
                         gas_meter.charge_simple_instr(S::LdTrue)?;
@@ -1247,23 +1077,9 @@ impl Frame {
                             interpreter.operand_stack.last_n(field_count as usize)?,
                         )?;
                         let args = interpreter.operand_stack.popn(field_count)?;
-
-                        if self.runtime_config.paranoid_hot_potato_checks {
-                            let ability = resolver.get_struct_ability(*sd_idx);
-                            if ability == AbilitySet::EMPTY {
-                                *hot_potato_counter += 1;
-                            }
-                        }
-
-                        let value = Value::struct_(if self.runtime_config.paranoid_type_checks {
-                            Struct::pack_with_tag(
-                                args,
-                                resolver.get_struct_type(*sd_idx).get_hash(),
-                            )
-                        } else {
-                            Struct::pack(args)
-                        });
-                        interpreter.operand_stack.push(value)?;
+                        interpreter
+                            .operand_stack
+                            .push(Value::struct_(Struct::pack(args)))?;
                     }
                     Bytecode::PackGeneric(si_idx) => {
                         let field_count = resolver.field_instantiation_count(*si_idx);
@@ -1272,60 +1088,12 @@ impl Frame {
                             interpreter.operand_stack.last_n(field_count as usize)?,
                         )?;
                         let args = interpreter.operand_stack.popn(field_count)?;
-
-                        if self.runtime_config.paranoid_hot_potato_checks {
-                            let ability = resolver.get_generic_struct_ability(*si_idx);
-                            if ability == AbilitySet::EMPTY {
-                                *hot_potato_counter += 1;
-                            }
-                        }
-
-                        let value = Value::struct_(if self.runtime_config.paranoid_type_checks {
-                            Struct::pack_with_tag(
-                                args,
-                                resolver
-                                    .instantiate_generic_type(*si_idx, self.ty_args())?
-                                    .get_hash(),
-                            )
-                        } else {
-                            Struct::pack(args)
-                        });
-
-                        interpreter.operand_stack.push(value)?;
+                        interpreter
+                            .operand_stack
+                            .push(Value::struct_(Struct::pack(args)))?;
                     }
-                    Bytecode::Unpack(sd_idx) => {
+                    Bytecode::Unpack(_sd_idx) => {
                         let struct_ = interpreter.operand_stack.pop_as::<Struct>()?;
-
-                        if self.runtime_config.paranoid_hot_potato_checks {
-                            let ability = resolver.get_struct_ability(*sd_idx);
-                            if ability == AbilitySet::EMPTY {
-                                if *hot_potato_counter == 0 {
-                                    return Err(PartialVMError::new(
-                                        StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR,
-                                    )
-                                    .with_message(format!(
-                                        "Destroying unexpected hot potato: {:?}",
-                                        struct_
-                                    )));
-                                }
-                                *hot_potato_counter -= 1;
-                            }
-                        }
-
-                        if self.runtime_config.paranoid_type_checks {
-                            let ty = resolver.get_struct_type(*sd_idx);
-                            if let Some(ty1) = struct_.tag() {
-                                if ty1 != ty.get_hash() {
-                                    return Err(PartialVMError::new(
-                                        StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR,
-                                    )
-                                    .with_message(format!(
-                                        "unexpected type mismatch, got {:?} expected {:?}",
-                                        struct_, ty
-                                    )));
-                                }
-                            }
-                        }
 
                         gas_meter.charge_unpack(false, struct_.field_views())?;
 
@@ -1333,40 +1101,8 @@ impl Frame {
                             interpreter.operand_stack.push(value)?;
                         }
                     }
-                    Bytecode::UnpackGeneric(si_idx) => {
+                    Bytecode::UnpackGeneric(_si_idx) => {
                         let struct_ = interpreter.operand_stack.pop_as::<Struct>()?;
-
-                        if self.runtime_config.paranoid_hot_potato_checks {
-                            let ability = resolver.get_generic_struct_ability(*si_idx);
-                            if ability == AbilitySet::EMPTY {
-                                if *hot_potato_counter == 0 {
-                                    return Err(PartialVMError::new(
-                                        StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR,
-                                    )
-                                    .with_message(format!(
-                                        "Destroying unexpected hot potato: {:?}",
-                                        struct_,
-                                    )));
-                                }
-                                *hot_potato_counter -= 1;
-                            }
-                        }
-
-                        if self.runtime_config.paranoid_type_checks {
-                            let ty = resolver.instantiate_generic_type(*si_idx, self.ty_args())?;
-
-                            if let Some(ty1) = struct_.tag() {
-                                if ty1 != ty.get_hash() {
-                                    return Err(PartialVMError::new(
-                                        StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR,
-                                    )
-                                    .with_message(format!(
-                                        "unexpected type mismatch, got {:?} expected {:?}",
-                                        struct_, ty
-                                    )));
-                                }
-                            }
-                        }
 
                         gas_meter.charge_unpack(true, struct_.field_views())?;
 
@@ -1386,7 +1122,7 @@ impl Frame {
                     Bytecode::WriteRef => {
                         let reference = interpreter.operand_stack.pop_as::<Reference>()?;
                         let value = interpreter.operand_stack.pop()?;
-                        gas_meter.charge_write_ref(&value, reference.value_view())?;
+                        gas_meter.charge_write_ref(&value)?;
                         reference.write_ref(value)?;
                     }
                     Bytecode::CastU8 => {
@@ -1395,6 +1131,20 @@ impl Frame {
                         interpreter
                             .operand_stack
                             .push(Value::u8(integer_value.cast_u8()?))?;
+                    }
+                    Bytecode::CastU16 => {
+                        gas_meter.charge_simple_instr(S::CastU16)?;
+                        let integer_value = interpreter.operand_stack.pop_as::<IntegerValue>()?;
+                        interpreter
+                            .operand_stack
+                            .push(Value::u16(integer_value.cast_u16()?))?;
+                    }
+                    Bytecode::CastU32 => {
+                        gas_meter.charge_simple_instr(S::CastU16)?;
+                        let integer_value = interpreter.operand_stack.pop_as::<IntegerValue>()?;
+                        interpreter
+                            .operand_stack
+                            .push(Value::u32(integer_value.cast_u32()?))?;
                     }
                     Bytecode::CastU64 => {
                         gas_meter.charge_simple_instr(S::CastU64)?;
@@ -1409,6 +1159,13 @@ impl Frame {
                         interpreter
                             .operand_stack
                             .push(Value::u128(integer_value.cast_u128()?))?;
+                    }
+                    Bytecode::CastU256 => {
+                        gas_meter.charge_simple_instr(S::CastU16)?;
+                        let integer_value = interpreter.operand_stack.pop_as::<IntegerValue>()?;
+                        interpreter
+                            .operand_stack
+                            .push(Value::u256(integer_value.cast_u256()?))?;
                     }
                     // Arithmetic Operations
                     Bytecode::Add => {
@@ -1651,11 +1408,6 @@ impl Frame {
                             interpreter.operand_stack.last_n(*num as usize)?,
                         )?;
                         let elements = interpreter.operand_stack.popn(*num as u16)?;
-                        if self.runtime_config.paranoid_type_checks {
-                            for element in elements.iter() {
-                                element.check_type(&ty)?;
-                            }
-                        }
                         let value = Vector::pack(&ty, elements)?;
                         interpreter.operand_stack.push(value)?;
                     }
@@ -1687,13 +1439,8 @@ impl Frame {
                     }
                     Bytecode::VecPushBack(si) => {
                         let elem = interpreter.operand_stack.pop()?;
-                        let ty = &resolver.instantiate_single_type(*si, self.ty_args())?;
-
-                        if self.runtime_config.paranoid_type_checks {
-                            elem.check_type(ty)?;
-                        }
-
                         let vec_ref = interpreter.operand_stack.pop_as::<VectorRef>()?;
+                        let ty = &resolver.instantiate_single_type(*si, self.ty_args())?;
                         gas_meter.charge_vec_push_back(make_ty!(ty), &elem)?;
                         vec_ref.push_back(elem, ty)?;
                     }
@@ -1707,11 +1454,7 @@ impl Frame {
                     Bytecode::VecUnpack(si, num) => {
                         let vec_val = interpreter.operand_stack.pop_as::<Vector>()?;
                         let ty = &resolver.instantiate_single_type(*si, self.ty_args())?;
-                        gas_meter.charge_vec_unpack(
-                            make_ty!(ty),
-                            NumArgs::new(*num),
-                            vec_val.elem_views(),
-                        )?;
+                        gas_meter.charge_vec_unpack(make_ty!(ty), NumArgs::new(*num))?;
                         let elements = vec_val.unpack(ty, *num)?;
                         for value in elements {
                             interpreter.operand_stack.push(value)?;

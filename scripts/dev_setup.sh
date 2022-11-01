@@ -218,6 +218,13 @@ function install_gcc_powerpc_linux_gnu {
   #fi
 }
 
+function install_lld {
+  # Right now, only install lld for linux
+  if [[ "$(uname)" == "Linux" ]]; then
+    install_pkg lld "$PACKAGE_MANAGER"
+  fi
+}
+
 function install_toolchain {
   version=$1
   FOUND=$(rustup show | grep -c "$version" || true)
@@ -279,6 +286,12 @@ function install_boogie {
     echo "Boogie $BOOGIE_VERSION already installed"
   else
     "${DOTNET_INSTALL_DIR}dotnet" tool update --tool-path "${DOTNET_INSTALL_DIR}tools/" Boogie --version $BOOGIE_VERSION
+    # If a higher version of boogie is installed, we can not install required version with `dotnet tool update` command above
+    # Print a tip here, since incompatible version of boogie might cause move-prover stuck forever
+    if [[ $? != 0 ]]; then
+      echo "failed to install boogie ${BOOGIE_VERSION}, if there is a more updated boogie installed, please consider uninstall it with"
+      echo "${DOTNET_INSTALL_DIR}dotnet tool uninstall --tool-path ${DOTNET_INSTALL_DIR}/tools Boogie"
+    fi
   fi
 }
 
@@ -588,6 +601,8 @@ if [[ "$INSTALL_BUILD_TOOLS" == "true" ]]; then
   install_pkg cmake "$PACKAGE_MANAGER"
   install_pkg clang "$PACKAGE_MANAGER"
   install_pkg llvm "$PACKAGE_MANAGER"
+
+  install_lld
 
   install_gcc_powerpc_linux_gnu "$PACKAGE_MANAGER"
   install_openssl_dev "$PACKAGE_MANAGER"

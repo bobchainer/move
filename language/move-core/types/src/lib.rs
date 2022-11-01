@@ -18,8 +18,8 @@ pub mod parser;
 pub mod proptest_types;
 pub mod resolver;
 pub mod trace;
-mod safe_serialize;
 pub mod transaction_argument;
+pub mod u256;
 #[cfg(test)]
 mod unit_tests;
 pub mod value;

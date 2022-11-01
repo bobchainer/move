@@ -6,6 +6,7 @@ use crate::{
     account_address::AccountAddress,
     identifier::Identifier,
     language_storage::{StructTag, TypeTag},
+    u256,
 };
 use anyhow::{bail, Result as AResult};
 use serde::{
@@ -43,8 +44,11 @@ pub enum MoveStruct {
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum MoveValue {
     U8(u8),
+    U16(u16),
+    U32(u32),
     U64(u64),
     U128(u128),
+    U256(u256::U256),
     Bool(bool),
     Address(AccountAddress),
     Vector(Vec<MoveValue>),
@@ -69,11 +73,6 @@ impl MoveFieldLayout {
 pub enum MoveStructLayout {
     /// The representation used by the MoveVM
     Runtime(Vec<MoveTypeLayout>),
-    /// The representation used by the MoveVM with extra unique identifier for distinct type.
-    CheckedRuntime {
-        fields: Vec<MoveTypeLayout>,
-        tag: u64,
-    },
     /// A decorated representation with human-readable field names that can be used by clients
     WithFields(Vec<MoveFieldLayout>),
     /// An even more decorated representation with both types and human-readable field names
@@ -89,10 +88,16 @@ pub enum MoveTypeLayout {
     Bool,
     #[serde(rename(serialize = "u8", deserialize = "u8"))]
     U8,
+    #[serde(rename(serialize = "u16", deserialize = "u16"))]
+    U16,
+    #[serde(rename(serialize = "u32", deserialize = "u32"))]
+    U32,
     #[serde(rename(serialize = "u64", deserialize = "u64"))]
     U64,
     #[serde(rename(serialize = "u128", deserialize = "u128"))]
     U128,
+    #[serde(rename(serialize = "u256", deserialize = "u256"))]
+    U256,
     #[serde(rename(serialize = "address", deserialize = "address"))]
     Address,
     #[serde(rename(serialize = "vector", deserialize = "vector"))]
@@ -250,7 +255,6 @@ impl MoveStructLayout {
     pub fn fields(&self) -> &[MoveTypeLayout] {
         match self {
             Self::Runtime(vals) => vals,
-            Self::CheckedRuntime { fields, tag: _ } => fields,
             Self::WithFields(_) | Self::WithTypes { .. } => {
                 // It's not possible to implement this without changing the return type, and some
                 // performance-critical VM serialization code uses the Runtime case of this.
@@ -263,17 +267,9 @@ impl MoveStructLayout {
     pub fn into_fields(self) -> Vec<MoveTypeLayout> {
         match self {
             Self::Runtime(vals) => vals,
-            Self::CheckedRuntime { fields, tag: _ } => fields,
             Self::WithFields(fields) | Self::WithTypes { fields, .. } => {
                 fields.into_iter().map(|f| f.layout).collect()
             }
-        }
-    }
-
-    pub fn tag(&self) -> Option<u64> {
-        match self {
-            Self::CheckedRuntime { fields: _, tag } => Some(*tag),
-            Self::Runtime(_) | Self::WithFields(_) | Self::WithTypes { .. } => None,
         }
     }
 }
@@ -287,8 +283,11 @@ impl<'d> serde::de::DeserializeSeed<'d> for &MoveTypeLayout {
         match self {
             MoveTypeLayout::Bool => bool::deserialize(deserializer).map(MoveValue::Bool),
             MoveTypeLayout::U8 => u8::deserialize(deserializer).map(MoveValue::U8),
+            MoveTypeLayout::U16 => u16::deserialize(deserializer).map(MoveValue::U16),
+            MoveTypeLayout::U32 => u32::deserialize(deserializer).map(MoveValue::U32),
             MoveTypeLayout::U64 => u64::deserialize(deserializer).map(MoveValue::U64),
             MoveTypeLayout::U128 => u128::deserialize(deserializer).map(MoveValue::U128),
+            MoveTypeLayout::U256 => u256::U256::deserialize(deserializer).map(MoveValue::U256),
             MoveTypeLayout::Address => {
                 AccountAddress::deserialize(deserializer).map(MoveValue::Address)
             }
@@ -391,11 +390,7 @@ impl<'d> serde::de::DeserializeSeed<'d> for &MoveStructLayout {
         deserializer: D,
     ) -> Result<Self::Value, D::Error> {
         match self {
-            MoveStructLayout::Runtime(layout)
-            | MoveStructLayout::CheckedRuntime {
-                fields: layout,
-                tag: _,
-            } => {
+            MoveStructLayout::Runtime(layout) => {
                 let fields =
                     deserializer.deserialize_tuple(layout.len(), StructFieldVisitor(layout))?;
                 Ok(MoveStruct::Runtime(fields))
@@ -426,8 +421,11 @@ impl serde::Serialize for MoveValue {
             MoveValue::Struct(s) => s.serialize(serializer),
             MoveValue::Bool(b) => serializer.serialize_bool(*b),
             MoveValue::U8(i) => serializer.serialize_u8(*i),
+            MoveValue::U16(i) => serializer.serialize_u16(*i),
+            MoveValue::U32(i) => serializer.serialize_u32(*i),
             MoveValue::U64(i) => serializer.serialize_u64(*i),
             MoveValue::U128(i) => serializer.serialize_u128(*i),
+            MoveValue::U256(i) => i.serialize(serializer),
             MoveValue::Address(a) => a.serialize(serializer),
             MoveValue::Signer(a) => a.serialize(serializer),
             MoveValue::Vector(v) => {
@@ -492,8 +490,11 @@ impl fmt::Display for MoveTypeLayout {
         match self {
             Bool => write!(f, "bool"),
             U8 => write!(f, "u8"),
+            U16 => write!(f, "u16"),
+            U32 => write!(f, "u32"),
             U64 => write!(f, "u64"),
             U128 => write!(f, "u128"),
+            U256 => write!(f, "u256"),
             Address => write!(f, "address"),
             Vector(typ) => write!(f, "vector<{}>", typ),
             Struct(s) => write!(f, "{}", s),
@@ -506,11 +507,7 @@ impl fmt::Display for MoveStructLayout {
     fn fmt(&self, f: &mut fmt::Formatter) -> std::fmt::Result {
         write!(f, "{{ ")?;
         match self {
-            Self::Runtime(layouts)
-            | Self::CheckedRuntime {
-                fields: layouts,
-                tag: _,
-            } => {
+            Self::Runtime(layouts) => {
                 for (i, l) in layouts.iter().enumerate() {
                     write!(f, "{}: {}, ", i, l)?
                 }
@@ -540,14 +537,17 @@ impl TryInto<TypeTag> for &MoveTypeLayout {
             MoveTypeLayout::Address => TypeTag::Address,
             MoveTypeLayout::Bool => TypeTag::Bool,
             MoveTypeLayout::U8 => TypeTag::U8,
+            MoveTypeLayout::U16 => TypeTag::U16,
+            MoveTypeLayout::U32 => TypeTag::U32,
             MoveTypeLayout::U64 => TypeTag::U64,
             MoveTypeLayout::U128 => TypeTag::U128,
+            MoveTypeLayout::U256 => TypeTag::U256,
             MoveTypeLayout::Signer => TypeTag::Signer,
             MoveTypeLayout::Vector(v) => {
                 let inner_type = &**v;
                 TypeTag::Vector(Box::new(inner_type.try_into()?))
             }
-            MoveTypeLayout::Struct(v) => TypeTag::Struct(Box::new(v.try_into()?)),
+            MoveTypeLayout::Struct(v) => TypeTag::Struct(v.try_into()?),
         })
     }
 }
@@ -558,7 +558,7 @@ impl TryInto<StructTag> for &MoveStructLayout {
     fn try_into(self) -> Result<StructTag, Self::Error> {
         use MoveStructLayout::*;
         match self {
-            Runtime(..) | CheckedRuntime { fields: _, tag: _ } | WithFields(..) => bail!(
+            Runtime(..) | WithFields(..) => bail!(
                 "Invalid MoveTypeLayout -> StructTag conversion--needed MoveLayoutType::WithTypes"
             ),
             WithTypes { type_, .. } => Ok(type_.clone()),
@@ -570,8 +570,11 @@ impl fmt::Display for MoveValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             MoveValue::U8(u) => write!(f, "{}u8", u),
+            MoveValue::U16(u) => write!(f, "{}u16", u),
+            MoveValue::U32(u) => write!(f, "{}u32", u),
             MoveValue::U64(u) => write!(f, "{}u64", u),
             MoveValue::U128(u) => write!(f, "{}u128", u),
+            MoveValue::U256(u) => write!(f, "{}u256", u),
             MoveValue::Bool(false) => write!(f, "false"),
             MoveValue::Bool(true) => write!(f, "true"),
             MoveValue::Address(a) => write!(f, "{}", a.to_hex_literal()),
