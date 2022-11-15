@@ -3723,6 +3723,7 @@ dependencies = [
  "better_any",
  "fail",
  "hex",
+ "log",
  "move-binary-format",
  "move-bytecode-verifier",
  "move-compiler",

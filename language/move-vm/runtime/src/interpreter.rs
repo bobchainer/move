@@ -8,6 +8,7 @@ use crate::{
     native_functions::NativeContext,
     trace,
 };
+use log::warn;
 use fail::fail_point;
 use move_binary_format::{
     errors::*,
@@ -181,43 +182,41 @@ impl Interpreter {
                 .map_err(|e| self.set_location(e))?;
         }
 
-        let gas_used_before_call = gas_meter.charged_already_total().unwrap();
+        let mut current_frame = Frame::new(function, ty_args, locals, self.runtime_config, 0);
 
-        let mut current_frame = Frame::new(function, ty_args, locals, self.runtime_config);
-
-        let (mut args_types, mut args_values) =
+        let (args_types, args_values) =
             current_frame.extract_types_and_arguments(loader, data_store);
 
-        loop {
-            let formatted_module_id: Option<String>;
-
-            if let Some(module_id) = current_frame.function.module_id() {
-                formatted_module_id = Some(module_id.short_str_lossless());
+        let call_trace = CallTrace {
+            depth: self.call_stack.len() as u32,
+            call_type: match current_frame.ty_args.len() > 0 {
+                true => CallType::CallGeneric,
+                false => CallType::Call,
+            },
+            module_id: if let Some(module_id) = current_frame.function.module_id() {
+                Some(module_id.short_str_lossless())
             } else {
-                formatted_module_id = None;
-            }
+                None
+            },
+            function: current_frame.function.name().into(),
+            ty_args: current_frame
+                .ty_args
+                .iter()
+                .map(|ty| {
+                    loader.type_to_type_layout(&ty).unwrap().to_string().into_bytes()
+                })
+                .collect(),
+            args_types: args_types.clone(),
+            args_values: args_values.clone(),
+            gas_used: 0,
+            err: None,
+        };
 
-            let mut call_trace = CallTrace {
-                depth: self.call_stack.len() as u32,
-                call_type: match current_frame.ty_args.len() > 0 {
-                    true => CallType::CallGeneric,
-                    false => CallType::Call,
-                },
-                module_id: formatted_module_id,
-                function: current_frame.function.name().into(),
-                ty_args: current_frame
-                    .ty_args
-                    .iter()
-                    .map(|ty| {
-                        loader.type_to_type_layout(&ty).unwrap().to_string().into_bytes()
-                    })
-                    .collect(),
-                args_types: args_types.clone(),
-                args_values: args_values.clone(),
-                gas_used: 0,
-                err: None,
-            };
+        self.call_traces.push(call_trace);
 
+        let mut gas_used_before_call = gas_meter.charged_already_total().unwrap();
+
+        loop {
             let resolver = current_frame.resolver(loader);
             let exit_code = current_frame //self
                 .execute_code(
@@ -228,22 +227,32 @@ impl Interpreter {
                     &mut hot_potato_counter,
                 )
                 .map_err(|err| {
+
                     let gas_used_after_call = gas_meter.charged_already_total().unwrap();
-                    call_trace.err = Some(err.clone().into_vm_status());
-                    call_trace.gas_used = gas_used_after_call
-                        .checked_sub(gas_used_before_call)
-                        .unwrap()
-                        .into();
+
+                    if let Some(call_trace) = self.call_traces.get_mut(current_frame.call_trace_index) {
+                        call_trace.err = Some(err.clone().into_vm_status());
+                        call_trace.gas_used += gas_used_after_call
+                            .checked_sub(gas_used_before_call)
+                            .unwrap()
+                            .value();
+                    }
+
                     self.maybe_core_dump(err, &current_frame)
                 })?;
 
             let gas_used_after_call = gas_meter.charged_already_total().unwrap();
-            call_trace.gas_used = gas_used_after_call
-                .checked_sub(gas_used_before_call)
-                .unwrap()
-                .into();
 
-            self.call_traces.push(call_trace);
+            if let Some(call_trace) = self.call_traces.get_mut(current_frame.call_trace_index) {
+                call_trace.gas_used += gas_used_after_call
+                    .checked_sub(gas_used_before_call)
+                    .unwrap()
+                    .value();
+            } else {
+                warn!("Failed to locate Call Trace after successful frame execution");
+            }
+
+            gas_used_before_call = gas_used_after_call;
 
             match exit_code {
                 ExitCode::Return => {
@@ -314,11 +323,8 @@ impl Interpreter {
                     }
 
                     let frame = self
-                        .make_call_frame(func, vec![], loader)
+                        .make_call_frame(loader, data_store, func, vec![])
                         .map_err(|err| self.maybe_core_dump(err, &current_frame))?;
-
-                    (args_types, args_values) =
-                        frame.extract_types_and_arguments(loader, data_store);
 
                     self.call_stack.push(current_frame).map_err(|frame| {
                         let err = PartialVMError::new(StatusCode::CALL_STACK_OVERFLOW);
@@ -368,11 +374,8 @@ impl Interpreter {
                         continue;
                     }
                     let frame = self
-                        .make_call_frame(func, ty_args, loader)
+                        .make_call_frame(loader, data_store, func, ty_args)
                         .map_err(|err| self.maybe_core_dump(err, &current_frame))?;
-
-                    (args_types, args_values) =
-                        frame.extract_types_and_arguments(loader, data_store);
 
                     self.call_stack.push(current_frame).map_err(|frame| {
                         let err = PartialVMError::new(StatusCode::CALL_STACK_OVERFLOW);
@@ -423,12 +426,7 @@ impl Interpreter {
     ///
     /// Native functions do not push a frame at the moment and as such errors from a native
     /// function are incorrectly attributed to the caller.
-    fn make_call_frame(
-        &mut self,
-        func: Arc<Function>,
-        ty_args: Vec<Type>,
-        loader: &Loader,
-    ) -> VMResult<Frame> {
+    fn make_call_frame(&mut self, loader: &Loader, data_store: &mut impl DataStore, func: Arc<Function>, ty_args: Vec<Type>) -> VMResult<Frame> {
         let resolver = func.get_resolver(loader);
         let mut locals = Locals::new(func.local_count());
         let arg_count = func.arg_count();
@@ -461,7 +459,40 @@ impl Interpreter {
                 .store_loc(arg_count - i - 1, v)
                 .map_err(|e| self.set_location(e))?;
         }
-        Ok(Frame::new(func, ty_args, locals, self.runtime_config))
+
+        let frame = Frame::new(func, ty_args, locals, self.runtime_config, self.call_traces.len());
+
+        let (args_types, args_values) =
+            frame.extract_types_and_arguments(loader, data_store);
+
+        let call_trace = CallTrace {
+            depth: self.call_stack.len() as u32,
+            call_type: match frame.ty_args.len() > 0 {
+                true => CallType::CallGeneric,
+                false => CallType::Call,
+            },
+            module_id: if let Some(module_id) = frame.function.module_id() {
+                Some(module_id.short_str_lossless())
+            } else {
+                None
+            },
+            function: frame.function.name().into(),
+            ty_args: frame
+                .ty_args
+                .iter()
+                .map(|ty| {
+                    loader.type_to_type_layout(&ty).unwrap().to_string().into_bytes()
+                })
+                .collect(),
+            args_types: args_types.clone(),
+            args_values: args_values.clone(),
+            gas_used: 0,
+            err: None,
+        };
+
+        self.call_traces.push(call_trace);
+
+        Ok(frame)
     }
 
     /// Call a native functions.
@@ -1028,6 +1059,7 @@ struct Frame {
     function: Arc<Function>,
     ty_args: Vec<Type>,
     runtime_config: RuntimeConfig,
+    call_trace_index: usize,
 }
 
 /// An `ExitCode` from `execute_code_unit`.
@@ -1047,6 +1079,7 @@ impl Frame {
         ty_args: Vec<Type>,
         locals: Locals,
         runtime_config: RuntimeConfig,
+        call_trace_index: usize
     ) -> Self {
         Frame {
             pc: 0,
@@ -1054,6 +1087,7 @@ impl Frame {
             function,
             ty_args,
             runtime_config,
+            call_trace_index,
         }
     }
 
